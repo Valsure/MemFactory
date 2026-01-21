@@ -471,8 +471,9 @@ class Neo4jClient:
     def save_edge(self, edge: Edge) -> bool:
         """保存关系边"""
         if self._use_mock:
-            self._mock_edges.append(edge)
-            return True
+            # 在Mock模式下禁止建立边，只作为简单数据库使用
+            print("[Neo4jClient] 警告: 在Mock模式下禁止建立边")
+            return False
         
         try:
             with self._get_session() as session:
@@ -744,6 +745,17 @@ class MemoryStore:
         self.neo4j = Neo4jClient()
         self.milvus = MilvusClient()
         self.embedding = EmbeddingClient()
+        
+        # 判断Mock状态
+        if self.neo4j._use_mock and self.milvus._use_mock:
+            self.use_mock = True
+            print("[MemoryStore] 运行在Mock模式 (纯内存存储)")
+        elif not self.neo4j._use_mock and not self.milvus._use_mock:
+            self.use_mock = False
+            print("[MemoryStore] 运行在真实数据库模式")
+        else:
+            raise ValueError("配置错误: Neo4j和Milvus必须同时为Mock模式或同时为真实模式")
+
         self._initialized = True
         print("[MemoryStore] 统一存储管理器初始化完成")
     
@@ -852,6 +864,32 @@ class MemoryStore:
         # 排除自身
         return [(m, s) for m, s in results if m.id != memory.id]
 
+    def to_list(self) -> List[Dict]:
+        if not self.use_mock:
+            raise RuntimeError("to_list 方法仅在 use_mock=True 时可用")
+            
+        results = []
+        # 直接访问Neo4jClient的mock store，其中存储了MemoryItem对象
+        for mem in self.neo4j._mock_store.values():
+            # 使用to_dict获取数据，embedding会被替换为描述字符串
+            item_dict = mem.to_dict()
+            results.append(item_dict)
+        return results
+
+    def from_list(self, data: List[Dict]) -> None:
+        if not self.use_mock:
+            raise RuntimeError("from_list 方法仅在 use_mock=True 时可用")
+            
+        # 清空现有Mock数据
+        self.neo4j._mock_store.clear()
+        self.milvus._mock_vectors.clear()
+        
+        for item_dict in data:
+            # 重建MemoryItem对象，此时embedding为None
+            mem = MemoryItem.from_dict(item_dict)
+            
+            # 使用save方法保存，会自动触发embedding生成并存入Neo4j和Milvus
+            self.save(mem)
 
 # =============================================================================
 # 全局单例获取函数
