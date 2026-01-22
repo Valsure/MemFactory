@@ -3,6 +3,7 @@ import os
 import json
 import re
 import copy
+from datetime import datetime
 from typing import List, Dict, Any, Tuple, Set
 
 # Add src to path
@@ -71,6 +72,19 @@ class LoCoMoPipeline:
             return sample['conversation'][key]
         return []
 
+    def get_session_time(self, sample: Dict, session_idx: int) -> str:
+        """Extracts and formats session time (e.g. '2023-05-08')."""
+        key = f"session_{session_idx}_date_time"
+        if 'conversation' in sample and key in sample['conversation']:
+            time_str = sample['conversation'][key]
+            # Format: "1:56 pm on 8 May, 2023"
+            try:
+                dt = datetime.strptime(time_str, "%I:%M %p on %d %B, %Y")
+                return dt.strftime("%Y-%m-%d")
+            except ValueError:
+                return time_str
+        return ''
+        
     def reset_memory_bank(self):
         """Resets the memory store for a new window."""
         if self.store.use_mock:
@@ -143,11 +157,12 @@ class LoCoMoPipeline:
             # Buffer for "f" (sliding window of dialogue)
             dialogue_buffer = [] # List of ConversationMessage
             dia_id_buffer = [] # List of dia_id
-            BUFFER_SIZE = 5 # Size of 'f'
+            BUFFER_SIZE = 4 # Size of 'f'
             
             # Iterate through sessions in this window
             for s_idx in window_sessions:
                 turns = self.get_session_content(sample, s_idx)
+                session_time = self.get_session_time(sample, s_idx)
                 if not turns:
                     continue
                 
@@ -158,9 +173,10 @@ class LoCoMoPipeline:
                     
                     msg = ConversationMessage(
                         role=speaker, 
-                        # TODO ： 这里的 role 应该怎么改？ 是否需要把 speker 添加到 text 里面？ 
+                        # 这里的 role 应该怎么改？ 是否需要把 speker 添加到 text 里面？ 
+                        # 就这样就行，详情见 common.py 中的 format_conversation 函数
                         content=text,
-                        timestamp=turn.get('timestamp', ''),
+                        timestamp=turn.get('timestamp', session_time),
                     )
                     
                     # Update dialogue buffer (f)
@@ -216,8 +232,33 @@ class LoCoMoPipeline:
                     # Constantly Update Memory
                     extraction_res = self.extractor.run(dialogue_buffer)
                     if extraction_res.memory_list:
-                        # TODO : 这里直接 save 是不对的，理论上应该有一个 UPDATE 的逻辑利用 updater
-                        self.store.save_batch(extraction_res.memory_list, generate_embedding=True)
+                        candidate_memories = extraction_res.memory_list
+
+                        for candidate in candidate_memories:
+                            # 1. Query related existing memories
+                            related_memories = self.store.find_related_memories(candidate, top_k=10)
+                            
+                            if not related_memories:
+                                candidate.user_id = "locomo_user"
+                                self.store.save(candidate, generate_embedding=True)
+                            else:
+                                # 2. Decide update action
+                                update_result = self.updater.decide_action(
+                                    new_memory=candidate,
+                                    related_memories=[m for m, s in related_memories]
+                                )
+                                # return: {"action", "final_memory", "deprecated_ids"}
+                                action, final_memory, deprecated_ids = update_result["action"], update_result.get("final_memory", candidate), update_result.get("deprecated_ids", [])
+                                if action in ["ADD", "MERGE", "OVERWRITE", "VERSION"]:
+                                    final_memory.user_id = "locomo_user"
+                                    self.store.save(final_memory, generate_embedding=True)
+                                if deprecated_ids:
+                                    for old_id in deprecated_ids:
+                                        self.store.delete(old_id)
+                                    
+                            
+
+                    
 
     def run(self):
         data = self.load_data()
