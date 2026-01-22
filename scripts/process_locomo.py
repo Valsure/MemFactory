@@ -103,6 +103,17 @@ class LoCoMoPipeline:
         valid_qas = []
         
         for qa in qas:
+            # Check Answer Key (support 'answer' and 'adversarial_answer')
+            ans_str = qa.get('answer')
+            if not ans_str:
+                ans_str = qa.get('adversarial_answer')
+            
+            if not ans_str:
+                self.log(f"  [Warning] Skipping QA without answer: {qa.get('question', '')[:30]}...")
+                continue
+            
+            qa['final_answer'] = ans_str
+
             evidence = qa.get('evidence', [])
             if not evidence:
                 continue
@@ -220,7 +231,7 @@ class LoCoMoPipeline:
                                     "M": memory_state,
                                     "f": f_data,
                                     "q": qa.get('question', ''),
-                                    "a": qa.get('answer', ''),                                    
+                                    "a": qa['final_answer'],                                    
                                     "sample_id": sample_id,
                                     "trigger_id": dia_id,
                                     "evidence": qa['evidence'],
