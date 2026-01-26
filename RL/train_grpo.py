@@ -171,7 +171,9 @@ class GRPOTrainer:
     
     # 生成经验(优势、token的概率分布)
     def generate_experiences(self, batch_data):
-        
+        # TODO 主要是这里得改一下，rollout 就是正常的 rollout 就好，要加一个能够测试奖励的函数
+        # TODO 在处理数据集的时候，要把原始数据集处理成支持 prompt 的形式，方便在 generate_samples 中使用
+        # prompt--model--n*rollouts ，现在的问题是，rollouts 是抽取更新分开？还是一起？rollouts 应该长成什么样子，后续才能打分？
         self.model.eval()
         samples_list = self.generate_samples(batch_data)
         
