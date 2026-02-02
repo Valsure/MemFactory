@@ -35,7 +35,7 @@ def main():
     # 1. Load Data
     # Path relative to script execution or absolute. 
     # Assuming running from Memory-CookBook root:
-    data_path = "/home/guozl/project/MemRL/Memory-CookBook/scripts/processed_locomo copy.json"
+    data_path = "/home/guozl/project/MemRL/Memory-CookBook/scripts/processed_locomo_copy.json"
     item = load_first_data_item(data_path)
     
      

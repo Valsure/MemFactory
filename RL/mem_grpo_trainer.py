@@ -41,8 +41,8 @@ class MemGRPOArguments:
     save_steps: int = 500
     epoch: int = 1
     num_generations: int = 4 # Group size
-    max_prompt_length: int = 1024
-    max_generate_length: int = 512
+    max_prompt_length: int = 4096
+    max_generate_length: int = 2048
     beta: float = 0.1 # KL penalty
     clip_eps: float = 0.2
     gradient_accumulation_steps: int = 1
@@ -54,23 +54,51 @@ class MemGRPOArguments:
 class MemoryDataset(Dataset):
     def __init__(self, data_path, tokenizer):
         self.data = []
+        raw_data = []
         if os.path.exists(data_path):
-            with open(data_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        item = json.loads(line)
-                        # Ensure keys match what trainer expects
-                        processed_item = {
-                            "memory": item.get("M", item.get("memory")),
-                            "fact": item.get("f", item.get("fact")),
-                            "query": item.get("q", item.get("query")),
-                            "answer": item.get("a", item.get("answer")),
-                            "context_memory": item.get("context_memory", [])
-                        }
-                        self.data.append(processed_item)
+            try:
+                # Try loading as a JSON array first
+                with open(data_path, "r", encoding="utf-8") as f:
+                    raw_data = json.load(f)
+            except json.JSONDecodeError:
+                # Fallback to JSONL
+                with open(data_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip():
+                            try:
+                                raw_data.append(json.loads(line))
+                            except json.JSONDecodeError:
+                                pass
         else:
-            print(f"Warning: {data_path} not found. Using dummy data.")
+            print(f"Warning: {data_path} not found.")
             assert False, f"{data_path} not found."
+
+        # Process and Sanitize
+        for item in raw_data:
+            # Helper to safely get list or default
+            def get_list(d, keys):
+                for k in keys:
+                    if d.get(k) is not None:
+                        return d[k]
+                assert False, f"Memory field not found in item: {item}"
+                return []
+            
+            # Helper to safely get str or default
+            def get_str(d, keys):
+                for k in keys:
+                    if d.get(k) is not None:
+                        return d[k]
+                assert False, f"Query field not found in item: {item}"
+                return ""
+
+            processed_item = {
+                "memory": get_list(item, ["M", "memory"]),
+                "fact": get_list(item, ["f", "fact"]),
+                "query": get_str(item, ["q", "query"]),
+                "answer": get_str(item, ["a", "answer"]),
+                "context_memory": get_list(item, ["context_memory"])
+            }
+            self.data.append(processed_item)
         
         self.tokenizer = tokenizer
 
@@ -213,11 +241,11 @@ class MemGRPOTrainer:
             
             # Calculate Rewards
             rewards = []
+            
             for j in range(self.args.num_generations):
-                # Pass original memory info. For simulation, fact + ctx_mem is enough.
                 r = self.downstream_evaluate(memory, fact, query, answer, ctx_mem, resp_texts_ext[j], resp_texts_upd[j])
                 rewards.append(r)
-            
+
             rewards_tensor = torch.tensor(rewards, device=self.args.device, dtype=torch.float32)
             
             # Attach rewards
@@ -257,7 +285,16 @@ class MemGRPOTrainer:
         self.model.eval()
         samples_list = self.generate_samples(batch_data)
         
-        batch_exp = {
+        batch_exp_ext = {
+            "prompt_response_ids": [],
+            "attention_mask": [],
+            "action_mask": [],
+            "advantages": [],
+            "old_action_log_probs": [],
+            "ref_action_log_probs": []
+        }
+        
+        batch_exp_upd = {
             "prompt_response_ids": [],
             "attention_mask": [],
             "action_mask": [],
@@ -278,24 +315,36 @@ class MemGRPOTrainer:
                 if self.ref_model:
                     ref_log_probs = self.get_action_log_probs(self.ref_model, samples.prompt_response_ids, samples.attention_mask, samples.num_actions)
 
-            batch_exp["prompt_response_ids"].append(samples.prompt_response_ids)
-            batch_exp["attention_mask"].append(samples.attention_mask)
-            batch_exp["action_mask"].append(samples.action_mask)
-            batch_exp["advantages"].append(advantages)
-            batch_exp["old_action_log_probs"].append(old_log_probs)
+            # Assign to correct batch dictionary based on step_type
+            if samples.step_type == 'extraction':
+                target_dict = batch_exp_ext
+            elif samples.step_type == 'update':
+                target_dict = batch_exp_upd
+            else:
+                continue
+
+            target_dict["prompt_response_ids"].append(samples.prompt_response_ids)
+            target_dict["attention_mask"].append(samples.attention_mask)
+            target_dict["action_mask"].append(samples.action_mask)
+            target_dict["advantages"].append(advantages)
+            target_dict["old_action_log_probs"].append(old_log_probs)
             if ref_log_probs is not None:
-                batch_exp["ref_action_log_probs"].append(ref_log_probs)
+                target_dict["ref_action_log_probs"].append(ref_log_probs)
 
-        if not batch_exp["prompt_response_ids"]:
-            return None
-
+        def collate_exp(exp_dict):
+            if not exp_dict["prompt_response_ids"]:
+                return None
+            return {
+                "prompt_response_ids": torch.cat(exp_dict["prompt_response_ids"], dim=0),
+                "attention_mask": torch.cat(exp_dict["attention_mask"], dim=0),
+                "action_mask": torch.cat(exp_dict["action_mask"], dim=0),
+                "advantages": torch.cat(exp_dict["advantages"], dim=0),
+                "old_action_log_probs": torch.cat(exp_dict["old_action_log_probs"], dim=0),
+                "ref_action_log_probs": torch.cat(exp_dict["ref_action_log_probs"], dim=0) if self.ref_model else None
+            }
         return {
-            "prompt_response_ids": torch.cat(batch_exp["prompt_response_ids"], dim=0),
-            "attention_mask": torch.cat(batch_exp["attention_mask"], dim=0),
-            "action_mask": torch.cat(batch_exp["action_mask"], dim=0),
-            "advantages": torch.cat(batch_exp["advantages"], dim=0),
-            "old_action_log_probs": torch.cat(batch_exp["old_action_log_probs"], dim=0),
-            "ref_action_log_probs": torch.cat(batch_exp["ref_action_log_probs"], dim=0) if self.ref_model else None
+            "extraction": collate_exp(batch_exp_ext),
+            "update": collate_exp(batch_exp_upd)
         }
 
     def compute_loss(self, model, inputs):
@@ -361,13 +410,28 @@ class MemGRPOTrainer:
         self.optimizer.zero_grad()
         self.global_steps = self.args.num_iterations * self.args.epoch * len(self.train_dataset) // (self.args.batch_size * self.args.gradient_accumulation_steps)
         
+        # Custom collate function to handle variable length lists (don't stack them)
+        def collate_fn(batch):
+            keys = batch[0].keys()
+            return {key: [d[key] for d in batch] for key in keys}
+
         for epoch in range(self.args.epoch):
-            dataloader = DataLoader(self.train_dataset, batch_size=self.args.batch_size, shuffle=True)
+            
+            dataloader = DataLoader(self.train_dataset, batch_size=self.args.batch_size, shuffle=False, collate_fn=collate_fn)
             for idx, batch in enumerate(dataloader):
                 experiences = self.generate_experiences(batch)
                 
                 if experiences:
-                    self.train_step(self.model, experiences, self.optimizer, idx)
+                    # Inner Loop for GRPO/PPO
+                    for _ in range(self.args.num_iterations):
+                        # Train Extraction
+                        if self.args.train_extraction and experiences["extraction"] is not None:
+                            self.train_step(self.model, experiences["extraction"], self.optimizer, idx)
+                        
+                        # Train Update
+                        if self.args.train_update and experiences["update"] is not None:
+                            self.train_step(self.model, experiences["update"], self.optimizer, idx)
+                    
                     self.update_steps += 1
                     
                     if self.update_steps % self.args.save_steps == 0:
@@ -380,5 +444,55 @@ class MemGRPOTrainer:
         self.tokenizer.save_pretrained(path)
 
 if __name__ == "__main__":
-    args = MemGRPOArguments()
-    pass
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name_or_path", type=str, default="/home/models/Qwen3-1.7B", help="Path to the model")
+    parser.add_argument("--data_path", type=str, default="./scripts/training_data_with_context.jsonl", help="Path to the training data")
+    parser.add_argument("--output_dir", type=str, default="./output/mem_grpo", help="Output directory")
+    
+    # Parse known args to allow passing other args if needed
+    args, unknown = parser.parse_known_args()
+    
+    print(f"Loading model from {args.model_name_or_path}...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name_or_path, 
+        torch_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+        device_map="auto",
+        trust_remote_code=True
+    )
+    
+    # Configure Training Arguments
+    grpo_args = MemGRPOArguments(
+        output_dir=args.output_dir,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        batch_size=2,
+        gradient_accumulation_steps=4,
+        num_generations=4, # Group size
+        save_steps=100,
+        epoch=1,
+        max_prompt_length=3172,
+        max_generate_length=4096,
+        train_extraction=True,
+        train_update=True
+    )
+    
+    print(f"Loading data from {args.data_path}...")
+    # Initialize Dataset
+    dataset = MemoryDataset(args.data_path, tokenizer)
+    
+    if len(dataset) == 0:
+        print("Error: Dataset is empty or file not found. Please run 'python scripts/process_locomo.py' first.")
+        assert False
+        
+    print("Initializing Trainer...")
+    trainer = MemGRPOTrainer(
+        model=model,
+        args=grpo_args,
+        train_dataset=dataset,
+        tokenizer=tokenizer
+    )
+    
+    print("Starting Training...")
+    trainer.train()

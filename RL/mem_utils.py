@@ -197,8 +197,8 @@ def parse_json_from_text(response: str) -> Optional[Dict]:
 
             return json.loads(response)
         except json.JSONDecodeError as e:
-            print(f"extract 结果 JSON 解析失败: {e}")
-            return None
+            # print(f"extract 结果 JSON 解析失败: {e}")
+            return {}
 
 def prepare_memory_lists(context_memory: List[Dict], extraction_output: str):
     """
@@ -230,8 +230,9 @@ def prepare_memory_lists(context_memory: List[Dict], extraction_output: str):
     # 2. Process Extraction Output
     candidate_list_fmt = []
     ext_json = parse_json_from_text(extraction_output)
-    if ext_json and "memory_list" in ext_json:
+    if ext_json and "memory_list" in ext_json and isinstance(ext_json["memory_list"], list):
         for item in ext_json["memory_list"]:
+            if not isinstance(item, dict): continue
             temp_id = id_counter
             id_counter += 1
             id_map[temp_id] = ("candidate", item)
@@ -339,48 +340,62 @@ class MemoryEvaluator:
                  extraction_output: str, 
                  update_plan_output: str) -> float:
         
-        # 1. Reset Memory Store
-        self.reset_memory(memory)
+        # 0. Format Check & Parsing
+        ext_json = parse_json_from_text(extraction_output)
+        upd_json = parse_json_from_text(update_plan_output)
         
-        # 2. Parse Extraction (Optional check, mainly for logging or fallback)
-        # We don't strictly need parsed extraction here if we just use it for ID mapping in apply_update_plan
+        is_ext_valid = isinstance(ext_json, dict) and "memory_list" in ext_json
+        is_upd_valid = isinstance(upd_json, dict) and "operations" in upd_json
         
-        # 3. Parse Update Plan
-        update_json = parse_json_from_text(update_plan_output)
+        if not is_ext_valid and not is_upd_valid:
+            return -0.2
+        if not is_ext_valid or not is_upd_valid:
+            return -0.15
         
-        # 4. Apply Update
-        self.apply_update_plan(context_memory, update_json, extraction_output)
-        
-        # 5. Retrieval
-        retrieved_docs = self.retrieve(query, top_k=15)
-        context_str = "\n".join([f"- {m.key}: {m.value}" for m in retrieved_docs])
-        
-        # 6. QA
-        qa_prompt = QA_PROMPT.format(context=context_str, question=query)
-        pred_answer = self.llm.chat("You are a helpful assistant.", qa_prompt)
-        # 处理思考过程：
-        if "<think>" in pred_answer:
-            if "</think>" in pred_answer:
-                pred_answer = pred_answer.split("</think>")[-1].strip()
-            else:# last 100 chars
-                pred_answer = pred_answer[-100:].strip()
+        try:
+            # 1. Reset Memory Store
+            self.reset_memory(memory)
+            
+            # 2. Apply Update (Using already parsed json to avoid double parsing issues, though apply_update_plan currently takes json object or relies on helper)
+            # Refactoring apply_update_plan to accept parsed objects or ensuring safe usage
+            # For now, we will pass the strings as before, but we know they are valid JSON structure-wise
+            # Wait, apply_update_plan calls prepare_memory_lists which calls parse_json_from_text again.
+            # Since we validated above, it should be fine.
+            
+            self.apply_update_plan(context_memory, upd_json, extraction_output)
+            
+            # 5. Retrieval
+            retrieved_docs = self.retrieve(query, top_k=15)
+            context_str = "\n".join([f"- {m.key}: {m.value}" for m in retrieved_docs])
+            
+            # 6. QA
+            qa_prompt = QA_PROMPT.format(context=context_str, question=query)
+            pred_answer = self.llm.chat("You are a helpful assistant.", qa_prompt)
+            # 处理思考过程：
+            if "<think>" in pred_answer:
+                if "</think>" in pred_answer:
+                    pred_answer = pred_answer.split("</think>")[-1].strip()
+                else:# last 100 chars
+                    pred_answer = pred_answer[-100:].strip()
 
-        # 7. Judge
-        judge_prompt = JUDGE_PROMPT.format(question=query, answer=answer, prediction=pred_answer)
-        judge_result = self.llm.chat("You are an impartial judge.", judge_prompt)
-        if "<think>" in judge_result:
-            if "</think>" in judge_result:
-                judge_result = judge_result.split("</think>")[-1].strip()
-            else:# last 100 chars
-                judge_result = judge_result[-100:].strip()
+            # 7. Judge
+            judge_prompt = JUDGE_PROMPT.format(question=query, answer=answer, prediction=pred_answer)
+            judge_result = self.llm.chat("You are an impartial judge.", judge_prompt)
+            if "<think>" in judge_result:
+                if "</think>" in judge_result:
+                    judge_result = judge_result.split("</think>")[-1].strip()
+                else:# last 100 chars
+                    judge_result = judge_result[-100:].strip()
 
-        # Parse True/False
-        if "True" in judge_result:
-            return 1.0
-        elif "False" in judge_result:
+            # Parse True/False
+            if "True" in judge_result:
+                return 1.0
+            elif "False" in judge_result:
+                return 0.0
+            else: 
+                return 0.0 # Ambiguous
+        except Exception as e:
+            # Catch all execution errors (DB error, logic error, etc.)
+            print(f"Evaluation Error: {e}")
             return 0.0
-        else: 
-            # TODO: 奖励函数还需要考虑模型的回答根本不合法（比如格式不正确）的情况
-            # 暂时先不管
-            return 0.0 # Ambiguous
 

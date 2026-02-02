@@ -794,7 +794,9 @@ class MemoryStore:
             milvus_success = self.milvus.insert(memory.id, memory.embedding, memory.user_id)
             
             if neo4j_success and milvus_success:
-                print(f"[MemoryStore] 保存成功: {memory.id} - {memory.key} (user: {memory.user_id})")
+                if not self.use_mock:
+                    # revised by guozl: 训练期间不打印保存成功，避免干扰训练日志
+                    print(f"[MemoryStore] 保存成功: {memory.id} - {memory.key} (user: {memory.user_id})")
                 return True
             else:
                 print(f"[MemoryStore] 保存部分失败: Neo4j={neo4j_success}, Milvus={milvus_success}")
