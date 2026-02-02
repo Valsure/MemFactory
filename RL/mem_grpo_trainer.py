@@ -355,7 +355,6 @@ class MemGRPOTrainer:
                 target_dict["ref_action_log_probs"].append(ref_log_probs)
 
         # Helper to collate a single experience dict
-        import ipdb; ipdb.set_trace()
         def collate_exp(exp_dict):
             if not exp_dict["prompt_response_ids"]:
                 return None
@@ -492,7 +491,7 @@ if __name__ == "__main__":
     grpo_args = MemGRPOArguments(
         output_dir=args.output_dir,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        batch_size=2,
+        batch_size=1,
         gradient_accumulation_steps=4,
         num_generations=4, # Group size
         save_steps=100,
