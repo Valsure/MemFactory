@@ -139,6 +139,13 @@ class MemGRPOTrainer:
         
         # Initialize Evaluator
         self.evaluator = mem_utils.MemoryEvaluator()
+        
+        # Initialize reward tracking
+        self.reward_history = {
+            'extraction_rewards': [],
+            'update_rewards': [],
+            'total_rewards': []
+        }
 
     def get_tokenizer(self, tokenizer):
         tokenizer.padding_side = "left"
@@ -252,6 +259,9 @@ class MemGRPOTrainer:
         
         # Calculate Rewards (requires iterating through batch and generations)
         all_rewards = []
+        extraction_rewards = []
+        update_rewards = []
+        
         for i in range(bs):
             rewards_i = []
             memory = batch_data['memory'][i]
@@ -268,7 +278,30 @@ class MemGRPOTrainer:
                     resp_texts_upd[global_idx]
                 )
                 rewards_i.append(r)
+                
+                # Track individual rewards for logging
+                extraction_rewards.append(r.extraction_score if hasattr(r, 'extraction_score') else 0)
+                update_rewards.append(r.update_score if hasattr(r, 'update_score') else 0)
+            
             all_rewards.append(torch.tensor(rewards_i, device=self.args.device, dtype=torch.float32))
+
+        # Log rewards to swanlab
+        if extraction_rewards:
+            avg_extraction_reward = sum(extraction_rewards) / len(extraction_rewards)
+            swanlab.log({"extraction_reward": avg_extraction_reward, "step": self.update_steps})
+            self.reward_history['extraction_rewards'].append(avg_extraction_reward)
+            
+        if update_rewards:
+            avg_update_reward = sum(update_rewards) / len(update_rewards)
+            swanlab.log({"update_reward": avg_update_reward, "step": self.update_steps})
+            self.reward_history['update_rewards'].append(avg_update_reward)
+            
+        # Calculate and log total reward
+        if extraction_rewards and update_rewards:
+            total_rewards = [(e + u) / 2 for e, u in zip(extraction_rewards, update_rewards)]
+            avg_total_reward = sum(total_rewards) / len(total_rewards)
+            swanlab.log({"total_reward": avg_total_reward, "step": self.update_steps})
+            self.reward_history['total_rewards'].append(avg_total_reward)
 
         # Organize Update Samples and Attach Rewards
         for i in range(bs):
@@ -433,8 +466,12 @@ class MemGRPOTrainer:
                 optimizer.step()
             optimizer.zero_grad()
             
+            # Log loss to swanlab
+            loss_value = loss.item()
+            swanlab.log({"training_loss": loss_value, "step": self.update_steps})
+            
             if self.update_steps % 10 == 0:
-                print(f"Step {self.update_steps}: Loss {loss.item():.4f}")
+                print(f"Step {self.update_steps}: Loss {loss_value:.4f}")
 
     def train(self):
         self.optimizer.zero_grad()
@@ -477,17 +514,39 @@ class MemGRPOTrainer:
         os.makedirs(path, exist_ok=True)
         self.model.save_pretrained(path)
         self.tokenizer.save_pretrained(path)
+        
+        # Save reward history
+        reward_log_path = os.path.join(path, "reward_history.json")
+        with open(reward_log_path, 'w') as f:
+            json.dump(self.reward_history, f, indent=2)
 
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str, default="/home/models/Qwen3-1.7B", help="Path to the model")
-    parser.add_argument("--data_path", type=str, default="./scripts/training_data_with_context.jsonl", help="Path to the training data")
+    parser.add_argument("--data_path", type=str, default="/home/datasets/temp/training_data_with_context.jsonl", help="Path to the training data")
     parser.add_argument("--output_dir", type=str, default="./output/mem_grpo", help="Output directory")
     
-    # Parse known args to allow passing other args if needed
     args, unknown = parser.parse_known_args()
+    
+    os.environ["SWANLAB_API_KEY"] = "Zkrggz0kWlnEuNRu5r4dz"
+    
+    swanlab.init(
+        project="MemFactory",
+        config={
+            "model_name": args.model_name_or_path,
+            "data_path": args.data_path,
+            "learning_rate": 5e-7,
+            "batch_size": 1,
+            "gradient_accumulation_steps": 4,
+            "num_generations": 4,
+            "max_prompt_length": 1024,
+            "max_generate_length": 2048,
+            "train_extraction": True,
+            "train_update": True
+        }
+    )
     
     print(f"Loading model from {args.model_name_or_path}...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
