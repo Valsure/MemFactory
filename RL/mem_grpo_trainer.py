@@ -536,7 +536,7 @@ if __name__ == "__main__":
         train_extraction=True,
         train_update=True
     )
-
+    os.environ["SWANLAB_API_KEY"] = "Zkrggz0kWlnEuNRu5r4dz"
     swanlab.init(
             project="MemFactory",
             config=vars(grpo_args)
