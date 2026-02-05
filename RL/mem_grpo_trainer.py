@@ -527,7 +527,7 @@ if __name__ == "__main__":
     grpo_args = MemGRPOArguments(
         output_dir=args.output_dir,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        batch_size=2,
+        batch_size=1,
         gradient_accumulation_steps=4,
         num_generations=4, # Group size
         save_steps=100,
