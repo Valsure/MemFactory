@@ -3,6 +3,8 @@ import json
 import os
 import sys
 import math
+import random
+from tqdm import tqdm
 from typing import List, Dict, Any
 
 # Add project root to sys.path
@@ -52,7 +54,7 @@ def process_data(source_path: str, target_path: str, k: int = 8, max_items: int 
     
     count = 0
     with open(target_path, 'a', encoding='utf-8') as f_out:
-        for item in source_data:
+        for item in tqdm(source_data, desc="Processing"):
             if count >= max_items:
                 break
                 
@@ -119,11 +121,61 @@ def process_data(source_path: str, target_path: str, k: int = 8, max_items: int 
                 print(f"Error processing item {sample_id}: {e}")
                 continue
 
+def split_dataset(source_file: str, train_file: str, test_file: str, split_ratio: float = 0.9):
+    """Split dataset into train and test sets."""
+    print(f"Splitting data from {source_file}...")
+    if not os.path.exists(source_file):
+        print(f"Source file {source_file} not found.")
+        return
+
+    data = []
+    with open(source_file, 'r', encoding='utf-8') as f:
+        for line in f:
+            if line.strip():
+                try:
+                    data.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    
+    if not data:
+        print("No data found to split.")
+        return
+
+    random.shuffle(data)
+    split_idx = int(len(data) * split_ratio)
+    train_data = data[:split_idx]
+    test_data = data[split_idx:]
+    
+    # Ensure output directories exist
+    os.makedirs(os.path.dirname(train_file), exist_ok=True)
+    os.makedirs(os.path.dirname(test_file), exist_ok=True)
+    
+    print(f"Writing {len(train_data)} items to {train_file}")
+    with open(train_file, 'w', encoding='utf-8') as f:
+        for item in train_data:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            
+    print(f"Writing {len(test_data)} items to {test_file}")
+    with open(test_file, 'w', encoding='utf-8') as f:
+        for item in test_data:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
 if __name__ == "__main__":
     # Configuration
     SOURCE_FILE = "/home/guozl/project/MemRL/Memory-CookBook/scripts/processed_locomo.json"
-    TARGET_FILE = "/home/guozl/project/MemRL/Memory-CookBook/scripts/training_data_with_context.jsonl"
+    TARGET_FILE = "/home/guozl/project/MemRL/Memory-CookBook/scripts/temp.jsonl"
     K = 8
-    MAX_ITEMS = 1024 # Process first 10 for testing as per user request "N items"
+    MAX_ITEMS = 1200 # Process first 10 for testing as per user request "N items"
+    SPLIT_DATA = False # Switch to enable data splitting
     
     process_data(SOURCE_FILE, TARGET_FILE, K, MAX_ITEMS)
+    
+    if SPLIT_DATA:
+        TRAIN_FILE = "../datas/train.jsonl"
+        TEST_FILE = "../datas/test.jsonl"
+        # Resolve relative paths relative to this script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        train_path = os.path.join(script_dir, TRAIN_FILE)
+        test_path = os.path.join(script_dir, TEST_FILE)
+        
+        split_dataset(TARGET_FILE, train_path, test_path)

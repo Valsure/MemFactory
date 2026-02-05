@@ -460,7 +460,7 @@ class MemGRPOTrainer:
 
         for epoch in range(self.args.epoch):
             
-            dataloader = DataLoader(self.train_dataset, batch_size=self.args.batch_size, shuffle=False, collate_fn=collate_fn)
+            dataloader = DataLoader(self.train_dataset, batch_size=self.args.batch_size, shuffle=True, collate_fn=collate_fn)
             pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch + 1}/{self.args.epoch}")
             for idx, batch in pbar:
                 experiences = self.generate_experiences(batch)
@@ -527,7 +527,7 @@ if __name__ == "__main__":
     grpo_args = MemGRPOArguments(
         output_dir=args.output_dir,
         device="cuda" if torch.cuda.is_available() else "cpu",
-        batch_size=1,
+        batch_size=2,
         gradient_accumulation_steps=4,
         num_generations=4, # Group size
         save_steps=100,

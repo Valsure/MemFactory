@@ -3,7 +3,7 @@ import os
 import json
 import re
 import copy
-import ipdb
+from tqdm import tqdm
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Set
 
@@ -22,7 +22,7 @@ from src.memory_update import MemoryUpdater, UpdateConfig
 
 
 class LoCoMoPipeline:
-    def __init__(self, data_path: str, output_path: str, verbose: bool = True):
+    def __init__(self, data_path: str, output_path: str, verbose: bool = False):
         self.data_path = data_path
         self.output_path = output_path
         self.verbose = verbose
@@ -104,10 +104,12 @@ class LoCoMoPipeline:
         valid_qas = []
         
         for qa in qas:
-            # Check Answer Key (support 'answer' and 'adversarial_answer')
+            # Check Answer Key
+            # Skip adversarial QAs as they are hallucinations/negative examples
+            if qa.get('adversarial_answer'):
+                continue
+
             ans_str = qa.get('answer')
-            if not ans_str:
-                ans_str = qa.get('adversarial_answer')
             
             if not ans_str:
                 self.log(f"  [Warning] Skipping QA without answer: {qa.get('question', '')[:30]}...")
@@ -280,7 +282,7 @@ class LoCoMoPipeline:
         with open(self.output_path, 'w', encoding='utf-8') as f:
             json.dump([], f)
 
-        for sample in data:
+        for sample in tqdm(data, desc="Processing LoCoMo"):
             self.process_sample(sample)
             
             # (2) 增量保存：每次处理完一个sample就更新文件
@@ -293,9 +295,9 @@ class LoCoMoPipeline:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", default="./datas/locomo10.json")
-    parser.add_argument("--output", default="./scripts/processed_locomo.json")
-    parser.add_argument("--limit", type=int, default=0, help="Limit number of samples to process (0 for all)")
+    parser.add_argument("--data", default="../datas/locomo10.json")
+    parser.add_argument("--output", default="./processed_locomo.json")
+    parser.add_argument("--limit", type=int, default=9, help="Limit number of samples to process (0 for all)")
     parser.add_argument("--dry-run", action="store_true", help="Use mock LLM for testing")
     args = parser.parse_args()
     
