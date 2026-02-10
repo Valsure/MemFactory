@@ -197,7 +197,7 @@ def parse_json_from_text(response: str) -> Optional[Dict]:
 
             return json.loads(response)
         except json.JSONDecodeError as e:
-            # print(f"extract 结果 JSON 解析失败: {e}")
+            print(f"extract 结果 JSON 解析失败: {e}")
             return {}
 
 def prepare_memory_lists(context_memory: List[Dict], extraction_output: str):
@@ -343,14 +343,21 @@ class MemoryEvaluator:
         ext_json = parse_json_from_text(extraction_output)
         upd_json = parse_json_from_text(update_plan_output)
         
-        is_ext_valid = isinstance(ext_json, dict) and "memory_list" in ext_json
-        is_upd_valid = isinstance(upd_json, dict) and "operations" in upd_json
+        # is_ext_valid = isinstance(ext_json, dict) and "memory_list" in ext_json
+        # is_upd_valid = isinstance(upd_json, dict) and "operations" in upd_json
         
-        if not is_ext_valid and not is_upd_valid:
-            return -0.2
-        if not is_ext_valid or not is_upd_valid:
-            return -0.15
+        # if not is_ext_valid and not is_upd_valid:
+        #     return -0.2
+        # if not is_ext_valid or not is_upd_valid:
+        #     return -0.15
         
+        extraction_reward = 0.5 if ext_json != {} else 0
+        update_reward = 0.5 if upd_json != {} else 0
+        if update_reward == 0:
+            print("warning, the update plan is empty!")
+
+        accuracy_reward = 0
+
         try:
             # 1. Reset Memory Store
             self.reset_memory(memory)
@@ -388,13 +395,13 @@ class MemoryEvaluator:
 
             # Parse True/False
             if "True" in judge_result:
-                return 1.0
-            elif "False" in judge_result:
-                return 0.0
-            else: 
-                return 0.0 # Ambiguous
+                accuracy_reward = 1
+            else:
+                accuracy_reward = 0
+
         except Exception as e:
             # Catch all execution errors (DB error, logic error, etc.)
             print(f"Evaluation Error: {e}")
-            return 0.0
-
+            accuracy_reward = 0
+            
+        return extraction_reward, update_reward, accuracy_reward

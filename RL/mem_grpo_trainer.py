@@ -13,7 +13,7 @@ import swanlab
 import random
 import sys
 from tqdm import tqdm
-
+import numpy as np
 try:
     from vllm import LLM, SamplingParams
     VLLM_AVAILABLE = True
@@ -347,7 +347,9 @@ class MemGRPOTrainer:
                     action_mask=action_mask_ext[start_idx:end_idx],
                     num_actions=action_mask_ext[start_idx:end_idx].size(1),
                     response_length=action_mask_ext[start_idx:end_idx].float().sum(dim=-1),
-                    prompt_length=prompt_lengths_ext[start_idx:end_idx],
+                    # prompt_length=prompt_lengths_ext[start_idx:end_idx],
+                    #TODO
+                    prompt_length=0,
                     step_type='extraction'
                 )
                 samples_list.append(samples_ext)
@@ -408,16 +410,24 @@ class MemGRPOTrainer:
             answer = batch_data['answer'][i]
             ctx_mem = batch_data['context_memory'][i]
             
+            extraction_rewards = update_rewards = accuracy_rewards = []
+
             for j in range(num_generations):
                 global_idx = i * num_generations + j
-                r = self.downstream_evaluate(
+                extraction_reward, update_reward, accuracy_reward = self.downstream_evaluate(
                     memory, fact, query, answer, ctx_mem, 
                     resp_texts_ext[global_idx], 
                     resp_texts_upd[global_idx]
                 )
-                rewards_i.append(r)
+                extraction_rewards.append(extraction_reward)
+                update_rewards.append(update_reward)
+                accuracy_rewards.append(accuracy_reward)
+                rewards_i.append(extraction_reward + update_reward + accuracy_reward)
             all_rewards.append(torch.tensor(rewards_i, device=self.args.device, dtype=torch.float32))
 
+            swanlab.log({"extraction_format_reward": np.mean(extraction_rewards),
+                         "update_format_reward": np.mean(update_rewards),
+                         "accuracy_reward": np.mean(accuracy_rewards)})
         # Organize Update Samples and Attach Rewards
         for i in range(bs):
             # Attach rewards to extraction samples if they exist
@@ -443,7 +453,9 @@ class MemGRPOTrainer:
                     action_mask=action_mask_upd[start_idx:end_idx],
                     num_actions=action_mask_upd[start_idx:end_idx].size(1),
                     response_length=action_mask_upd[start_idx:end_idx].float().sum(dim=-1),
-                    prompt_length=prompt_lengths_upd[start_idx:end_idx],
+                    # prompt_length=prompt_lengths_upd[start_idx:end_idx],
+                    #TODO
+                    prompt_length = 0,
                     step_type='update',
                     rewards=all_rewards[i]
                 )
@@ -490,7 +502,7 @@ class MemGRPOTrainer:
             swanlab.log({
                             f"reward_mean/{samples.step_type}": mean_reward.item(),
                             f"reward_std/{samples.step_type}": std_reward.item(),
-                            f"prompt_len_mean/{samples.step_type}": samples.prompt_length.float().mean().item(),
+                            # f"prompt_len_mean/{samples.step_type}": samples.prompt_length.float().mean().item(),
                             f"response_len_mean/{samples.step_type}": samples.response_length.float().mean().item(),
                             "reward_mean": mean_reward.item(), # 全局平均
                             "reward_std": std_reward.item()    # 全局标准差
@@ -645,11 +657,11 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name_or_path", type=str, default="/home/models/qwen3-4b", help="Path to the model")
-    parser.add_argument("--data_path", type=str, default="./datas/train.jsonl", help="Path to the training data")
+    parser.add_argument("--model_name_or_path", type=str, default="/home/models/Qwen3-1.7B", help="Path to the model")
+    parser.add_argument("--data_path", type=str, default="/home/datasets/temp/train.jsonl", help="Path to the training data")
     parser.add_argument("--output_dir", type=str, default="./output/mem_grpo", help="Output directory")
     parser.add_argument("--use_vllm", action="store_true", help="Use vLLM for faster inference")
-    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.8, help="GPU memory utilization for vLLM")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.7, help="GPU memory utilization for vLLM")
     parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1, help="Tensor parallel size for vLLM")
     
     # Parse known args to allow passing other args if needed
@@ -681,12 +693,12 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         device="cuda" if torch.cuda.is_available() else "cpu",
         batch_size=1,
-        gradient_accumulation_steps=4,
+        gradient_accumulation_steps=1,
         num_generations=4, # Group size
         save_steps=100,
         epoch=1,
-        max_prompt_length=2548,
-        max_generate_length=5520,
+        max_prompt_length=2048,
+        max_generate_length=2048,
         train_extraction=True,
         train_update=True,
         use_vllm=getattr(args, 'use_vllm', False),  # 使用命令行参数
