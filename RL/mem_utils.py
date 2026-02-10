@@ -364,7 +364,7 @@ class MemoryEvaluator:
             self.apply_update_plan(context_memory, upd_json, extraction_output)
             
             # 5. Retrieval
-            retrieved_docs = self.retrieve(query, top_k=15)
+            retrieved_docs = self.retrieve(query, top_k=30)
             context_str = "\n".join([f"- {m.key}: {m.value}" for m in retrieved_docs])
             
             # 6. QA

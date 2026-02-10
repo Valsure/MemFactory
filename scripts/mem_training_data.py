@@ -75,7 +75,7 @@ def process_data(source_path: str, target_path: str, k: int = 8, max_items: int 
                     print(f"Skipping {sample_id}: No facts.")
                     continue
                     
-                recent_facts = facts[-2:]
+                recent_facts = facts[-4:]
                 extraction_prompt = construct_extraction_prompt(recent_facts)
                 extraction_output = llm.chat("You are a memory extraction expert.", extraction_prompt)
                 ext_json = parse_json_from_text(extraction_output)
@@ -87,25 +87,54 @@ def process_data(source_path: str, target_path: str, k: int = 8, max_items: int 
                 retrieved_context = []
                 
                 if extracted_memories:
-                    search_targets = []
-                    if len(extracted_memories) == 1:
-                        search_targets.append((extracted_memories[0], k))
-                    else:
-                        targets = extracted_memories[-2:]
-                        k_per = k // 2
-                        for t in targets:
-                            search_targets.append((t, k_per))
+                    # 1. Semantic Search
+                    # Each extracted memory participates in search, top 3 for each
+                    semantic_memories_map = {} # id -> MemoryItem
                     
-                    seen_ids = set()
-                    
-                    for mem_dict, limit in search_targets:
+                    for mem_dict in extracted_memories:
                         query_text = f"{mem_dict.get('key', '')}: {mem_dict.get('value', '')}"
-                        results = store.search_similar(query_text, top_k=limit)
-                        
+                        # top_k=3 for each candidate
+                        results = store.search_similar(query_text, top_k=3)
                         for mem_item, score in results:
-                            if mem_item.id not in seen_ids:
-                                seen_ids.add(mem_item.id)
-                                retrieved_context.append(mem_item.to_dict())
+                            semantic_memories_map[mem_item.id] = mem_item
+                            
+                    # 2. Temporal Search
+                    # Get latest 10 memories, pick random 5
+                    all_memories = store.get_all()
+                    
+                    temporal_candidates = all_memories[-10:]
+                    temporal_selection = []
+                    if temporal_candidates:
+                        k_temporal = min(5, len(temporal_candidates))
+                        temporal_selection = random.sample(temporal_candidates, k_temporal)
+                        
+                    temporal_memories_map = {m.id: m for m in temporal_selection}
+                    
+                    # 3. Combine and Truncate
+                    # Priority: Temporal > Semantic
+                    # Limit: 13
+                    
+                    final_context_map = {}
+                    
+                    # Add all temporal memories first
+                    for m_id, m_item in temporal_memories_map.items():
+                        final_context_map[m_id] = m_item
+                        
+                    # Calculate remaining slots
+                    remaining_slots = 13 - len(final_context_map)
+                    
+                    if remaining_slots > 0:
+                        # Filter semantic memories that are not already in final_context (temporal)
+                        semantic_only = [m for m in semantic_memories_map.values() if m.id not in final_context_map]
+                        
+                        # Randomly select to fill slots
+                        count_to_add = min(remaining_slots, len(semantic_only))
+                        if count_to_add > 0:
+                            selected_semantic = random.sample(semantic_only, count_to_add)
+                            for m in selected_semantic:
+                                final_context_map[m.id] = m
+                                
+                    retrieved_context = [m.to_dict() for m in final_context_map.values()]
                 
                 if not retrieved_context:
                     print(f"Skipping {sample_id}: empty context_memory.")
@@ -164,9 +193,9 @@ if __name__ == "__main__":
     # Configuration
     SOURCE_FILE = "/home/guozl/project/MemRL/Memory-CookBook/scripts/processed_locomo.json"
     TARGET_FILE = "/home/guozl/project/MemRL/Memory-CookBook/scripts/temp.jsonl"
-    K = 8
-    MAX_ITEMS = 1200 # Process first 10 for testing as per user request "N items"
-    SPLIT_DATA = False # Switch to enable data splitting
+    K = 9
+    MAX_ITEMS = 567 # Process first 10 for testing as per user request "N items"
+    SPLIT_DATA = True # Switch to enable data splitting
     
     process_data(SOURCE_FILE, TARGET_FILE, K, MAX_ITEMS)
     

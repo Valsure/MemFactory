@@ -269,11 +269,15 @@ def main():
         "4B-200step": "../output/mem_grpo/checkpoint_200",
         "4B-300step": "../output/mem_grpo/checkpoint_300",
         "4B-400step": "../output/mem_grpo/checkpoint_400",
+        "4B-500step": "../output/mem_grpo/checkpoint_500",
+        "4B-600step": "../output/mem_grpo/checkpoint_600",
+        "4B-700step": "../output/mem_grpo/checkpoint_700",
+        "4B-800step": "../output/mem_grpo/checkpoint_800",
     }
     
     # Define your benchmarks here
     benchmarks_config = {
-        "TrainData": "../scripts/training_data_with_context.jsonl",
+        "TrainData": "../datas/train.jsonl",
         "TestData": "../datas/test.jsonl",
         # "LocomoNo10": os.path.join(os.path.dirname(current_dir), "scripts", "processed_locomo.json"),
     }

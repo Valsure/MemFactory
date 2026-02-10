@@ -134,8 +134,8 @@ class LoCoMoPipeline:
             sessions = [e[0] for e in parsed_ev]
             min_s, max_s = min(sessions), max(sessions)
             
-            # Rule: If span > 3 sessions, ignore.
-            if (max_s - min_s) > 2:
+            # Rule: If span > 0 sessions (cross-session), ignore.
+            if (max_s - min_s) > 0:
                 continue
             
             # Find trigger (last evidence)
@@ -164,7 +164,7 @@ class LoCoMoPipeline:
                         pass
         
         for start_s in range(1, max_session + 1):
-            window_sessions = [start_s, start_s+1, start_s+2]
+            window_sessions = [start_s]
             
             self.log(f"  Window: {window_sessions}")
             
@@ -340,9 +340,9 @@ def process_sample_wrapper(args):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", default="../datas/locomo10.json")
+    parser.add_argument("--data", default=os.path.join(project_root, "datas", "locomo10.json"))
     parser.add_argument("--output", default="./processed_locomo.json")
-    parser.add_argument("--limit", type=int, default=9, help="Limit number of samples to process (0 for all)")
+    parser.add_argument("--limit", type=int, default=3, help="Limit number of samples to process (0 for all)")
     parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers")
     parser.add_argument("--dry-run", action="store_true", help="Use mock LLM for testing")
     args = parser.parse_args()

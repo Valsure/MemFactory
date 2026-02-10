@@ -30,7 +30,8 @@ class Samples:
     attention_mask: Optional[torch.LongTensor]
     action_mask: Optional[torch.BoolTensor]
     num_actions: Union[int, torch.Tensor]
-    response_length: int
+    response_length: torch.Tensor
+    prompt_length: torch.Tensor
     step_type: str # 'extraction' or 'update'
     rewards: Optional[torch.Tensor] = None
 
@@ -191,6 +192,8 @@ class MemGRPOTrainer:
                                      truncation=True, 
                                      return_tensors='pt').to(self.args.device)
         
+        prompt_lengths_ext = tokenized_ext['attention_mask'].sum(dim=1)
+        
         with torch.no_grad():
             ext_outputs = self.model.generate(**tokenized_ext, 
                                             max_new_tokens=self.args.max_generate_length,
@@ -220,6 +223,7 @@ class MemGRPOTrainer:
                     action_mask=action_mask_ext[start_idx:end_idx],
                     num_actions=action_mask_ext[start_idx:end_idx].size(1),
                     response_length=action_mask_ext[start_idx:end_idx].float().sum(dim=-1),
+                    prompt_length=prompt_lengths_ext[start_idx:end_idx],
                     step_type='extraction'
                 )
                 samples_list.append(samples_ext)
@@ -241,6 +245,8 @@ class MemGRPOTrainer:
                                      max_length=self.args.max_prompt_length,
                                      truncation=True,
                                      return_tensors='pt').to(self.args.device)
+        
+        prompt_lengths_upd = tokenized_upd['attention_mask'].sum(dim=1)
         
         with torch.no_grad():
             upd_outputs = self.model.generate(**tokenized_upd,
@@ -296,6 +302,7 @@ class MemGRPOTrainer:
                     action_mask=action_mask_upd[start_idx:end_idx],
                     num_actions=action_mask_upd[start_idx:end_idx].size(1),
                     response_length=action_mask_upd[start_idx:end_idx].float().sum(dim=-1),
+                    prompt_length=prompt_lengths_upd[start_idx:end_idx],
                     step_type='update',
                     rewards=all_rewards[i]
                 )
@@ -342,6 +349,8 @@ class MemGRPOTrainer:
             swanlab.log({
                             f"reward_mean/{samples.step_type}": mean_reward.item(),
                             f"reward_std/{samples.step_type}": std_reward.item(),
+                            f"prompt_len_mean/{samples.step_type}": samples.prompt_length.float().mean().item(),
+                            f"response_len_mean/{samples.step_type}": samples.response_length.float().mean().item(),
                             "reward_mean": mean_reward.item(), # 全局平均
                             "reward_std": std_reward.item()    # 全局标准差
                         })
@@ -460,7 +469,7 @@ class MemGRPOTrainer:
 
         for epoch in range(self.args.epoch):
             
-            dataloader = DataLoader(self.train_dataset, batch_size=self.args.batch_size, shuffle=True, collate_fn=collate_fn)
+            dataloader = DataLoader(self.train_dataset, batch_size=self.args.batch_size, shuffle=False, collate_fn=collate_fn)
             pbar = tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Epoch {epoch + 1}/{self.args.epoch}")
             for idx, batch in pbar:
                 experiences = self.generate_experiences(batch)
@@ -496,7 +505,7 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str, default="/home/models/qwen3-4b", help="Path to the model")
-    parser.add_argument("--data_path", type=str, default="./scripts/training_data_with_context.jsonl", help="Path to the training data")
+    parser.add_argument("--data_path", type=str, default="./datas/train.jsonl", help="Path to the training data")
     parser.add_argument("--output_dir", type=str, default="./output/mem_grpo", help="Output directory")
     
     # Parse known args to allow passing other args if needed
@@ -532,8 +541,8 @@ if __name__ == "__main__":
         num_generations=4, # Group size
         save_steps=100,
         epoch=1,
-        max_prompt_length=2048,
-        max_generate_length=4096,
+        max_prompt_length=2548,
+        max_generate_length=5520,
         train_extraction=True,
         train_update=True
     )
