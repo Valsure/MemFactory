@@ -61,7 +61,7 @@ class MemGRPOArguments:
     train_update: bool = True
     gradient_checkpointing: bool = True
     # vLLM configuration
-    use_vllm: bool = True
+    use_vllm: bool = False
     model_path: Optional[str] = None
     vllm_gpu_memory_utilization: float = 0.8
     vllm_tensor_parallel_size: int = 1
@@ -139,8 +139,14 @@ class MemGRPOTrainer:
         self.tokenizer = self.get_tokenizer(tokenizer)
         # Initialize vLLM engine if available
         self.vllm_engine = None
+        
+        # FORCE DISABLE VLLM to avoid training with frozen model
+        if hasattr(args, 'use_vllm') and args.use_vllm:
+            print("WARNING: VLLM has been forcibly disabled. Using VLLM during training causes the model to generate with frozen weights instead of updated weights. Falling back to PyTorch generation.")
+            self.args.use_vllm = False
+
         # import pdb;pdb.set_trace()
-        if VLLM_AVAILABLE and hasattr(args, 'use_vllm') and args.use_vllm:
+        if False and VLLM_AVAILABLE and hasattr(args, 'use_vllm') and args.use_vllm:
             try:
                 # 获取模型路径 - 支持多种来源
                 model_path = None
@@ -264,7 +270,8 @@ class MemGRPOTrainer:
                 max_new_tokens=self.args.max_generate_length,
                 temperature=1.0,
                 pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id
+                eos_token_id=self.tokenizer.eos_token_id,
+                do_sample=True
             )
         return outputs
 
@@ -410,7 +417,9 @@ class MemGRPOTrainer:
             answer = batch_data['answer'][i]
             ctx_mem = batch_data['context_memory'][i]
             
-            extraction_rewards = update_rewards = accuracy_rewards = []
+            extraction_rewards = []
+            update_rewards = []
+            accuracy_rewards = []
 
             for j in range(num_generations):
                 global_idx = i * num_generations + j
@@ -424,11 +433,11 @@ class MemGRPOTrainer:
                 accuracy_rewards.append(accuracy_reward)
                 rewards_i.append(extraction_reward + update_reward + accuracy_reward)
             all_rewards.append(torch.tensor(rewards_i, device=self.args.device, dtype=torch.float32))
-
             swanlab.log({"extraction_format_reward": np.mean(extraction_rewards),
                          "update_format_reward": np.mean(update_rewards),
                          "accuracy_reward": np.mean(accuracy_rewards)})
         # Organize Update Samples and Attach Rewards
+        
         for i in range(bs):
             # Attach rewards to extraction samples if they exist
             if self.args.train_extraction:
@@ -658,10 +667,10 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str, default="/home/models/Qwen3-1.7B", help="Path to the model")
-    parser.add_argument("--data_path", type=str, default="/home/datasets/temp/train.jsonl", help="Path to the training data")
+    parser.add_argument("--data_path", type=str, default="./datas/train.jsonl", help="Path to the training data")
     parser.add_argument("--output_dir", type=str, default="./output/mem_grpo", help="Output directory")
     parser.add_argument("--use_vllm", action="store_true", help="Use vLLM for faster inference")
-    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.7, help="GPU memory utilization for vLLM")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9, help="GPU memory utilization for vLLM")
     parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1, help="Tensor parallel size for vLLM")
     
     # Parse known args to allow passing other args if needed
@@ -696,14 +705,14 @@ if __name__ == "__main__":
         gradient_accumulation_steps=1,
         num_generations=4, # Group size
         save_steps=100,
-        epoch=1,
-        max_prompt_length=2048,
-        max_generate_length=2048,
+        epoch=2,
+        max_prompt_length=3072,
+        max_generate_length=4096,
         train_extraction=True,
         train_update=True,
-        use_vllm=getattr(args, 'use_vllm', False),  # 使用命令行参数
+        use_vllm=False, # Forcibly disable VLLM
         model_path=args.model_name_or_path,  # 显式设置模型路径
-        vllm_gpu_memory_utilization=getattr(args, 'vllm_gpu_memory_utilization', 0.8),
+        vllm_gpu_memory_utilization=getattr(args, 'vllm_gpu_memory_utilization', 0.9),
         vllm_tensor_parallel_size=getattr(args, 'vllm_tensor_parallel_size', 1)
     )
     os.environ["SWANLAB_API_KEY"] = "Zkrggz0kWlnEuNRu5r4dz"

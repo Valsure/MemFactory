@@ -282,12 +282,15 @@ class MemoryEvaluator:
         else:
             print("Warning: Running evaluation on real database. Skipping memory reset to avoid data loss.")
 
-    def apply_update_plan(self, context_memory: List[Dict], update_plan: Dict, extraction_output: str) -> None:
+    def apply_update_plan(self, context_memory: List[Dict], update_plan: Dict, extraction_output: str) -> bool:
         """
         Execute update plan on the memory store.
         """
+        update_err_flag = False
+
         if not update_plan or "operations" not in update_plan:
-            return
+            update_err_flag = True
+            return update_err_flag
             
         # Reconstruct the mapping to interpret sequential IDs
         _, _, id_map = prepare_memory_lists(context_memory, extraction_output)
@@ -297,8 +300,8 @@ class MemoryEvaluator:
             action = op.get("op", "NONE").upper()
             
             if temp_id not in id_map:
-                continue
-                
+                update_err_flag = True
+                continue    
             origin_type, origin_obj = id_map[temp_id]
             
             if origin_type == "context":
@@ -321,6 +324,8 @@ class MemoryEvaluator:
                         tags=origin_obj.get("tags", [])
                     )
                     self.store.save(new_mem)
+        return update_err_flag
+            
 
     def retrieve(self, query: str, top_k: int = 3) -> List[MemoryItem]:
         """
@@ -337,7 +342,7 @@ class MemoryEvaluator:
                  answer: str, 
                  context_memory: List[Dict], 
                  extraction_output: str, 
-                 update_plan_output: str) -> float:
+                 update_plan_output: str):
         
         # 0. Format Check & Parsing
         ext_json = parse_json_from_text(extraction_output)
@@ -368,8 +373,10 @@ class MemoryEvaluator:
             # Wait, apply_update_plan calls prepare_memory_lists which calls parse_json_from_text again.
             # Since we validated above, it should be fine.
             
-            self.apply_update_plan(context_memory, upd_json, extraction_output)
-            
+            update_err_flag = self.apply_update_plan(context_memory, upd_json, extraction_output)
+            if update_err_flag:
+                update_reward = 0
+
             # 5. Retrieval
             retrieved_docs = self.retrieve(query, top_k=30)
             context_str = "\n".join([f"- {m.key}: {m.value}" for m in retrieved_docs])

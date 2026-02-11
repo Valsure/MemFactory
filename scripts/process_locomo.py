@@ -343,7 +343,7 @@ if __name__ == "__main__":
     parser.add_argument("--data", default=os.path.join(project_root, "datas", "locomo10.json"))
     parser.add_argument("--output", default="./processed_locomo.json")
     parser.add_argument("--limit", type=int, default=3, help="Limit number of samples to process (0 for all)")
-    parser.add_argument("--workers", type=int, default=1, help="Number of parallel workers")
+    parser.add_argument("--workers", type=int, default=3, help="Number of parallel workers")
     parser.add_argument("--dry-run", action="store_true", help="Use mock LLM for testing")
     args = parser.parse_args()
     
