@@ -666,12 +666,18 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name_or_path", type=str, default="/home/models/Qwen3-1.7B", help="Path to the model")
+    parser.add_argument("--model_name_or_path", type=str, default="/home/models/qwen3-4b", help="Path to the model")
     parser.add_argument("--data_path", type=str, default="./datas/train.jsonl", help="Path to the training data")
     parser.add_argument("--output_dir", type=str, default="./output/mem_grpo", help="Output directory")
     parser.add_argument("--use_vllm", action="store_true", help="Use vLLM for faster inference")
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9, help="GPU memory utilization for vLLM")
     parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1, help="Tensor parallel size for vLLM")
+    parser.add_argument("--beta", type=float, default=0.1, help="KL penalty beta")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--lr", type=float, default=5e-7, help="Learning rate")
+    parser.add_argument("--save_steps", type=int, default=1000, help="Save steps")
+    parser.add_argument("--max_generate_length", type=int, default=4096, help="Max generate length")
+    parser.add_argument("--wandb_name", type=str, default=None, help="SwanLab experiment name")
     
     # Parse known args to allow passing other args if needed
     args, unknown = parser.parse_known_args()
@@ -702,12 +708,14 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         device="cuda" if torch.cuda.is_available() else "cpu",
         batch_size=1,
-        gradient_accumulation_steps=1,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        lr=args.lr,
+        beta=args.beta,
         num_generations=4, # Group size
-        save_steps=100,
+        save_steps=args.save_steps,
         epoch=2,
         max_prompt_length=3072,
-        max_generate_length=4096,
+        max_generate_length=args.max_generate_length,
         train_extraction=True,
         train_update=True,
         use_vllm=False, # Forcibly disable VLLM
@@ -718,7 +726,8 @@ if __name__ == "__main__":
     os.environ["SWANLAB_API_KEY"] = "Zkrggz0kWlnEuNRu5r4dz"
     swanlab.init(
             project="MemFactory",
-            config=vars(grpo_args)
+            config=vars(grpo_args),
+            name=args.wandb_name
         )
     
     print(f"Loading data from {args.data_path}...")
