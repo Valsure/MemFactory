@@ -6,7 +6,7 @@
 output/
 */output/*
 output
-
+experiments/*.sh
 
 # Temporary files
 tmp/

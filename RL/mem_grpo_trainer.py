@@ -408,9 +408,13 @@ class MemGRPOTrainer:
             resp_texts_upd = self.tokenizer.batch_decode(resp_ids_upd, skip_special_tokens=True)
 
         # Calculate Rewards (requires iterating through batch and generations)
-        all_rewards = []
+        all_rewards_ext = []
+        all_rewards_upd = []
+        
         for i in range(bs):
-            rewards_i = []
+            rewards_i_ext = []
+            rewards_i_upd = []
+            
             memory = batch_data['memory'][i]
             fact = batch_data['fact'][i]
             query = batch_data['query'][i]
@@ -431,11 +435,21 @@ class MemGRPOTrainer:
                 extraction_rewards.append(extraction_reward)
                 update_rewards.append(update_reward)
                 accuracy_rewards.append(accuracy_reward)
-                rewards_i.append(extraction_reward + update_reward + accuracy_reward)
-            all_rewards.append(torch.tensor(rewards_i, device=self.args.device, dtype=torch.float32))
+                
+                # Modified Reward Allocation based on user request
+                # Extraction Sample Reward = Extraction Format Reward + Final Correctness Reward
+                rewards_i_ext.append(extraction_reward + accuracy_reward)
+                
+                # Update Sample Reward = Update Format Reward + Final Correctness Reward
+                rewards_i_upd.append(update_reward + accuracy_reward)
+                
+            all_rewards_ext.append(torch.tensor(rewards_i_ext, device=self.args.device, dtype=torch.float32))
+            all_rewards_upd.append(torch.tensor(rewards_i_upd, device=self.args.device, dtype=torch.float32))
+            
             swanlab.log({"extraction_format_reward": np.mean(extraction_rewards),
                          "update_format_reward": np.mean(update_rewards),
                          "accuracy_reward": np.mean(accuracy_rewards)})
+        
         # Organize Update Samples and Attach Rewards
         
         for i in range(bs):
@@ -443,7 +457,7 @@ class MemGRPOTrainer:
             if self.args.train_extraction:
                 # Find the extraction sample corresponding to this batch item
                 # samples_list already contains bs extraction samples in order
-                samples_list[i].rewards = all_rewards[i]
+                samples_list[i].rewards = all_rewards_ext[i]
             
             if self.args.train_update:
                 start_idx = i * num_generations
@@ -466,7 +480,7 @@ class MemGRPOTrainer:
                     #TODO
                     prompt_length = 0,
                     step_type='update',
-                    rewards=all_rewards[i]
+                    rewards=all_rewards_upd[i]
                 )
                 samples_list.append(samples_upd)
                 
@@ -679,6 +693,10 @@ if __name__ == "__main__":
     parser.add_argument("--max_generate_length", type=int, default=4096, help="Max generate length")
     parser.add_argument("--wandb_name", type=str, default=None, help="SwanLab experiment name")
     
+    # Add training mode arguments
+    parser.add_argument("--no_train_extraction", action="store_true", help="Disable training extraction")
+    parser.add_argument("--no_train_update", action="store_true", help="Disable training update")
+    
     # Parse known args to allow passing other args if needed
     args, unknown = parser.parse_known_args()
     
@@ -716,8 +734,8 @@ if __name__ == "__main__":
         epoch=2,
         max_prompt_length=3072,
         max_generate_length=args.max_generate_length,
-        train_extraction=True,
-        train_update=True,
+        train_extraction=not args.no_train_extraction,
+        train_update=not args.no_train_update,
         use_vllm=False, # Forcibly disable VLLM
         model_path=args.model_name_or_path,  # 显式设置模型路径
         vllm_gpu_memory_utilization=getattr(args, 'vllm_gpu_memory_utilization', 0.9),
