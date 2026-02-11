@@ -7,13 +7,17 @@ Memory Engineering 核心模块
 
 包含以下子模块：
 - common: 公共配置和工具（LLM、Embedding、Neo4j、Milvus客户端）
-- memory_extraction: 记忆抽取
-- memory_search: 记忆检索
-- memory_organization: 记忆组织
-- memory_update: 记忆更新
+- configs: 各模块配置类
+- templates: Prompt模板
+- extraction: 记忆抽取
+- search: 记忆检索
+- organization: 记忆组织
+- update: 记忆更新
 """
 
+# =============================================================================
 # 公共模块
+# =============================================================================
 from .common import (
     # 数据结构
     MemoryItem,
@@ -48,18 +52,32 @@ from .common import (
     format_conversation,
 )
 
-# 记忆抽取模块
-from .memory_extraction import (
+# =============================================================================
+# 配置模块 - 从新的 configs 目录导入
+# =============================================================================
+from .configs import (
     ExtractionConfig,
+    OrganizationConfig,
+    SearchConfig,
+    UpdateConfig,
+)
+
+# =============================================================================
+# 记忆抽取模块 - 从新的 extraction 目录导入
+# =============================================================================
+from .extraction import (
     MemoryExtractor,
     SimpleExtractor,
     ReActExtractor,
+    MemoryBuffer,
     extract_memories,
+    detect_lang,
 )
 
-# 记忆检索模块
-from .memory_search import (
-    SearchConfig,
+# =============================================================================
+# 记忆检索模块 - 从新的 search 目录导入
+# =============================================================================
+from .search import (
     Query,
     MemorySearcher,
     PassiveRetriever,
@@ -69,9 +87,10 @@ from .memory_search import (
     search_memories,
 )
 
-# 记忆组织模块
-from .memory_organization import (
-    OrganizationConfig,
+# =============================================================================
+# 记忆组织模块 - 从新的 organization 目录导入
+# =============================================================================
+from .organization import (
     Session,
     Phase,
     EventUnit,
@@ -85,9 +104,10 @@ from .memory_organization import (
     organize_memories,
 )
 
-# 记忆更新模块
-from .memory_update import (
-    UpdateConfig,
+# =============================================================================
+# 记忆更新模块 - 从新的 update 目录导入
+# =============================================================================
+from .update import (
     ConflictType,
     ConflictRecord,
     UpdateResult,
@@ -139,6 +159,30 @@ __all__ = [
     "MemoryOrganizer",
     "MemoryUpdater",
     
+    # 抽取器
+    "SimpleExtractor",
+    "ReActExtractor",
+    "MemoryBuffer",
+    
+    # 检索器
+    "PassiveRetriever",
+    "ActiveRetriever",
+    "DTRRetriever",
+    "ContextInjector",
+    
+    # 组织器
+    "TemporalStructureBuilder",
+    "EventStructureBuilder",
+    "SemanticStructureBuilder",
+    "HierarchyBuilder",
+    
+    # 更新器
+    "MemoryOverwriter",
+    "MemoryMerger",
+    "MemoryVersionManager",
+    "ConflictResolver",
+    "MemoryForgetter",
+    
     # 客户端
     "LLMClient",
     "EmbeddingClient",
@@ -159,4 +203,5 @@ __all__ = [
     "generate_id",
     "current_timestamp",
     "format_conversation",
+    "detect_lang",
 ]
