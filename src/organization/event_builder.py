@@ -146,15 +146,102 @@ class EventStructureBuilder:
         return edges
     
     def _infer_relation(self, event_a: EventUnit, event_b: EventUnit) -> Tuple[str, float]:
-        """推断两个事件之间的关系"""
+        """使用 LLM 推断两个事件之间的关系"""
+        return self._llm_infer_relation(event_a, event_b)
+    
+    def _llm_infer_relation(self, event_a: EventUnit, event_b: EventUnit) -> Tuple[str, float]:
+        """使用 LLM 推断事件关系"""
+        # 构建事件描述
+        event_a_msg = self._format_event_message(event_a)
+        event_b_msg = self._format_event_message(event_b)
+        
+        # 获取所有可用的关系类型
+        valid_relation_types = [rt.value for rt in RelationType]
+        
+        prompt = f"""Given two events in chronological order, determine if there is a semantic relationship between them.
+
+Event A:
+- {event_a_msg}
+
+Event B:
+- {event_b_msg}
+
+Please determine:
+1. Did Event A cause Event B? (causes - causal relationship)
+2. Does Event B resolve the problem described in Event A? (resolves - resolution relationship)
+3. Does Event B depend on Event A? (depends_on - dependency relationship)
+4. Do both belong to the same topic? (same_topic - topic relationship)
+5. Does Event A contain Event B? (contains - containment relationship)
+6. Is there only a general association? (related_to - association relationship)
+7. Is there only temporal sequence without semantic association? (follows - temporal relationship)
+
+Output JSON format:
+{{"relation": "causes/resolves/depends_on/same_topic/contains/related_to/follows", "confidence": 0.0-1.0, "reasoning": "brief explanation of judgment basis"}}
+
+Output JSON only."""
+
+        response = self.llm.chat(
+            system_prompt="You are an event relationship analysis expert, skilled at judging causal, temporal, and dependency relationships between events.",
+            user_prompt=prompt
+        )
+        
+        result = self.llm.parse_json(response)
+        
+        if not result:
+            # LLM 解析失败，回退到规则方法
+            return self._rule_based_infer_relation(event_a, event_b)
+        
+        relation_type = result.get("relation", RelationType.RELATED_TO.value)
+        confidence = result.get("confidence", 0.5)
+        
+        # 验证关系类型是否有效
+        if relation_type not in valid_relation_types:
+            relation_type = RelationType.RELATED_TO.value
+        
+        # 确保 confidence 在合理范围内
+        confidence = max(0.0, min(1.0, float(confidence)))
+        
+        return relation_type, confidence
+    
+    def _format_event_message(self, event: EventUnit) -> str:
+        """格式化事件消息"""
+        parts = []
+        
+        # 构建主干描述
+        if event.agent and event.action:
+            if event.object:
+                parts.append(f"{event.agent} {event.action} {event.object}")
+            else:
+                parts.append(f"{event.agent} {event.action}")
+        elif event.action:
+            parts.append(event.action)
+        
+        # 添加结果
+        if event.outcome:
+            parts.append(f"Result: {event.outcome}")
+        
+        # 添加上下文
+        if event.context:
+            parts.append(f"Context: {event.context}")
+        
+        return ", ".join(parts) if parts else "Unknown event"
+    
+    def _rule_based_infer_relation(self, event_a: EventUnit, event_b: EventUnit) -> Tuple[str, float]:
+        """基于规则的关系推断（作为 LLM 失败时的回退方案）"""
         action_a = event_a.action.lower() if event_a.action else ""
         action_b = event_b.action.lower() if event_b.action else ""
         
-        # 简单规则推断
+        # 因果关系
         if "计划" in action_a and ("完成" in action_b or "执行" in action_b):
             return RelationType.CAUSES.value, 0.8
         
+        # 解决关系
         if "问题" in action_a and "解决" in action_b:
             return RelationType.RESOLVES.value, 0.85
         
+        # 依赖关系
+        if "需要" in action_b or "依赖" in action_b:
+            return RelationType.DEPENDS_ON.value, 0.7
+        
+        # 默认时序关系
         return RelationType.FOLLOWS.value, 0.6

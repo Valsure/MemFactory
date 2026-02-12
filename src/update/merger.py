@@ -44,30 +44,62 @@ class MemoryMerger:
         self.llm = get_llm_client()
         self.embedding = get_embedding_client()
     
-    def should_merge(self, memory_a: MemoryItem, memory_b: MemoryItem) -> Tuple[bool, float]:
+    def should_merge(self, memory_a: MemoryItem, memory_b: MemoryItem, 
+                     debug: bool = False) -> Tuple[bool, float]:
         """
         判断两条记忆是否应该合并
         
+        Args:
+            memory_a: 记忆A（通常是新记忆）
+            memory_b: 记忆B（通常是已有记忆）
+            debug: 是否打印详细调试信息
+            
         Returns:
             (是否应该合并, 相似度)
         """
         # 必须是同一用户
         if memory_a.user_id != memory_b.user_id:
+            if debug or self.config.verbose:
+                print(f"[MemoryMerger] 用户不同，跳过: {memory_a.user_id} vs {memory_b.user_id}")
             return False, 0.0
         
         # 必须是同一类型
         if memory_a.memory_type != memory_b.memory_type:
+            if debug or self.config.verbose:
+                print(f"[MemoryMerger] 类型不同，跳过: {memory_a.memory_type} vs {memory_b.memory_type}")
             return False, 0.0
+        
+        # 构建用于 embedding 的文本
+        text_a = f"{memory_a.key} {memory_a.value}"
+        text_b = f"{memory_b.key} {memory_b.value}"
         
         # 计算相似度
         if memory_a.embedding and memory_b.embedding:
             similarity = self.embedding.similarity(memory_a.embedding, memory_b.embedding)
+            embedding_source = "cached"
         else:
-            emb_a = self.embedding.embed(f"{memory_a.key} {memory_a.value}")
-            emb_b = self.embedding.embed(f"{memory_b.key} {memory_b.value}")
+            emb_a = self.embedding.embed(text_a)
+            emb_b = self.embedding.embed(text_b)
             similarity = self.embedding.similarity(emb_a, emb_b)
+            embedding_source = "computed"
         
         should = similarity >= self.config.similarity_threshold
+        
+        # 调试输出
+        if debug or self.config.verbose:
+            print(f"\n[MemoryMerger] ========== 相似度计算 ==========")
+            print(f"[MemoryMerger] 文本A (新记忆):")
+            print(f"  Key: {memory_a.key}")
+            print(f"  Value: {memory_a.value[:100]}{'...' if len(memory_a.value) > 100 else ''}")
+            print(f"  Full text: {text_a[:150]}{'...' if len(text_a) > 150 else ''}")
+            print(f"[MemoryMerger] 文本B (已有记忆):")
+            print(f"  Key: {memory_b.key}")
+            print(f"  Value: {memory_b.value[:100]}{'...' if len(memory_b.value) > 100 else ''}")
+            print(f"  Full text: {text_b[:150]}{'...' if len(text_b) > 150 else ''}")
+            print(f"[MemoryMerger] 相似度: {similarity:.4f} (来源: {embedding_source})")
+            print(f"[MemoryMerger] 阈值: {self.config.similarity_threshold}, 应合并: {should}")
+            print(f"[MemoryMerger] =====================================\n")
+        
         return should, similarity
     
     def merge_two(self, memory_a: MemoryItem, memory_b: MemoryItem) -> MemoryItem:

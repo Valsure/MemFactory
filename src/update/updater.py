@@ -20,6 +20,7 @@ try:
     from .version_manager import MemoryVersionManager
     from .conflict_resolver import ConflictResolver
     from .forgetter import MemoryForgetter
+    from .semantic_judge import SemanticRelationJudge
 except ImportError:
     from common import (
         MemoryItem,
@@ -32,6 +33,7 @@ except ImportError:
     from update.version_manager import MemoryVersionManager
     from update.conflict_resolver import ConflictResolver
     from update.forgetter import MemoryForgetter
+    from update.semantic_judge import SemanticRelationJudge
 
 
 class MemoryUpdater:
@@ -52,6 +54,7 @@ class MemoryUpdater:
         self.version_manager = MemoryVersionManager(self.config)
         self.conflict_resolver = ConflictResolver(self.config)
         self.forgetter = MemoryForgetter(self.config)
+        self.semantic_judge = SemanticRelationJudge(self.config)  # 新增：LLM语义判定器
         
         # 数据库客户端
         self.neo4j = get_neo4j_client()
@@ -60,6 +63,10 @@ class MemoryUpdater:
         
         if self.config.verbose:
             print(f"[MemoryUpdater] 初始化完成，策略: {self.config.strategy}")
+            print(f"[MemoryUpdater] 阈值配置: high={self.config.high_similarity_threshold}, "
+                  f"medium={self.config.medium_similarity_threshold}, "
+                  f"llm_judge={self.config.llm_judge_threshold}, "
+                  f"use_llm={self.config.use_llm_semantic_judge}")
     
     def run(self, memory: MemoryItem,
             action: str = None,
@@ -124,6 +131,13 @@ class MemoryUpdater:
         这是Pipeline流程中的核心决策函数：
         根据新抽取的记忆和已有相关记忆，决定应该执行什么操作
         
+        决策流程：
+        1. 计算 embedding 相似度
+        2. 高度相似 (> high_threshold): IGNORE 或 MERGE
+        3. 中等相似 (> medium_threshold): 检查冲突，OVERWRITE/VERSION/MERGE
+        4. 低相似但超过 LLM 判定阈值: 调用 LLM 辅助判断
+        5. 极低相似: 直接 ADD
+        
         Args:
             new_memory: 新抽取的候选记忆
             related_memories: 查询到的相关已有记忆
@@ -154,18 +168,41 @@ class MemoryUpdater:
                 print(f"[MemoryUpdater] 决策: ADD - {result['reason']}")
             return result
         
-        # 检查是否有高度相似的记忆（可能是重复）
-        highest_similarity = 0.0
-        most_similar_memory = None
+        # Step 1: 计算所有相关记忆的相似度
+        if self.config.verbose:
+            print(f"\n[MemoryUpdater] ========== 开始计算相似度 ==========")
+            print(f"[MemoryUpdater] 新记忆: {new_memory.key}")
+            print(f"[MemoryUpdater] 新记忆内容: {new_memory.value[:80]}...")
+            print(f"[MemoryUpdater] 候选已有记忆数量: {len(related_memories)}")
+            print(f"[MemoryUpdater] -----------------------------------------")
         
-        for related in related_memories:
-            should_merge, similarity = self.merger.should_merge(new_memory, related)
-            if similarity > highest_similarity:
-                highest_similarity = similarity
-                most_similar_memory = related
+        similarity_scores = []
+        for i, related in enumerate(related_memories):
+            # 只对前5个候选记忆打印详细调试信息
+            debug_this = self.config.verbose and i < 5
+            _, similarity = self.merger.should_merge(new_memory, related, debug=debug_this)
+            similarity_scores.append((related, similarity))
+            
+            # 对于后面的记忆，只打印简要信息
+            if self.config.verbose and i >= 5:
+                print(f"[MemoryUpdater] [{i+1}] {related.key[:30]}... → 相似度: {similarity:.4f}")
         
-        # 高度相似（>0.85）：可能是重复，忽略或合并
-        if highest_similarity > 0.85:
+        # 按相似度排序
+        similarity_scores.sort(key=lambda x: x[1], reverse=True)
+        highest_similarity = similarity_scores[0][1]
+        most_similar_memory = similarity_scores[0][0]
+        
+        if self.config.verbose:
+            print(f"\n[MemoryUpdater] ========== 相似度排序结果 (Top 5) ==========")
+            for i, (mem, sim) in enumerate(similarity_scores[:5]):
+                marker = "→ " if i == 0 else "  "
+                print(f"[MemoryUpdater] {marker}[{i+1}] {sim:.4f} | {mem.key}: {mem.value[:50]}...")
+            print(f"[MemoryUpdater] ==============================================")
+            print(f"[MemoryUpdater] 最高相似度: {highest_similarity:.4f}")
+            print(f"[MemoryUpdater] 阈值: high={self.config.high_similarity_threshold}, medium={self.config.medium_similarity_threshold}, llm={self.config.llm_judge_threshold}")
+        
+        # Step 2: 高度相似（> high_threshold）：可能是重复，忽略或合并
+        if highest_similarity > self.config.high_similarity_threshold:
             # 检查内容是否完全相同
             if new_memory.value.strip() == most_similar_memory.value.strip():
                 result["action"] = "IGNORE"
@@ -178,8 +215,8 @@ class MemoryUpdater:
                 result["deprecated_ids"] = [most_similar_memory.id]
                 result["reason"] = f"与已有记忆高度相似 (相似度: {highest_similarity:.2f})，执行合并"
         
-        # 中等相似（0.6-0.85）：检查是否有冲突
-        elif highest_similarity > 0.6:
+        # Step 3: 中等相似（> medium_threshold）：检查是否有冲突
+        elif highest_similarity > self.config.medium_similarity_threshold:
             conflicts = self.conflict_resolver.detect_conflict(new_memory, [most_similar_memory])
             
             if conflicts:
@@ -191,7 +228,7 @@ class MemoryUpdater:
                     result["action"] = "OVERWRITE"
                     result["final_memory"] = new_memory
                     result["deprecated_ids"] = [most_similar_memory.id]
-                    result["reason"] = f"检测到事实冲突，以新信息覆盖"
+                    result["reason"] = f"检测到事实冲突，以新信息覆盖 (相似度: {highest_similarity:.2f})"
                 else:
                     # 偏好/时间冲突：版本化
                     _, new_version = self.version_manager.create_version(
@@ -200,7 +237,7 @@ class MemoryUpdater:
                     result["action"] = "VERSION"
                     result["final_memory"] = new_version
                     result["deprecated_ids"] = [most_similar_memory.id]
-                    result["reason"] = f"检测到{conflict_type.value}冲突，创建新版本"
+                    result["reason"] = f"检测到{conflict_type.value}冲突，创建新版本 (相似度: {highest_similarity:.2f})"
             else:
                 # 无冲突，合并补充信息
                 merged = self.merger.merge_two(most_similar_memory, new_memory)
@@ -209,13 +246,67 @@ class MemoryUpdater:
                 result["deprecated_ids"] = [most_similar_memory.id]
                 result["reason"] = f"信息互补 (相似度: {highest_similarity:.2f})，执行合并"
         
-        # 低相似（<0.6）：作为新记忆添加
+        # Step 4: 低相似但超过 LLM 判定阈值：使用 LLM 辅助判断
+        elif (highest_similarity > self.config.llm_judge_threshold and 
+              self.config.use_llm_semantic_judge):
+            
+            if self.config.verbose:
+                print(f"[MemoryUpdater] 相似度 {highest_similarity:.3f} 在边界区域，启用LLM语义判定...")
+            
+            # 调用 LLM 判断语义关系
+            llm_result = self.semantic_judge.judge_semantic_relation(
+                new_memory, most_similar_memory, highest_similarity
+            )
+            
+            if self.config.verbose:
+                print(f"[MemoryUpdater] LLM判定结果: related={llm_result['is_related']}, "
+                      f"type={llm_result['relation_type']}, action={llm_result['suggested_action']}")
+            
+            # 根据 LLM 判断结果决定操作
+            if llm_result["is_related"] and llm_result["confidence"] > 0.6:
+                suggested_action = llm_result["suggested_action"]
+                
+                if suggested_action == "IGNORE":
+                    result["action"] = "IGNORE"
+                    result["reason"] = f"LLM判定: {llm_result['reason']} (相似度: {highest_similarity:.2f})"
+                
+                elif suggested_action == "MERGE":
+                    merged = self.merger.merge_two(most_similar_memory, new_memory)
+                    result["action"] = "MERGE"
+                    result["final_memory"] = merged
+                    result["deprecated_ids"] = [most_similar_memory.id]
+                    result["reason"] = f"LLM判定需合并: {llm_result['reason']} (相似度: {highest_similarity:.2f})"
+                
+                elif suggested_action == "OVERWRITE":
+                    result["action"] = "OVERWRITE"
+                    result["final_memory"] = new_memory
+                    result["deprecated_ids"] = [most_similar_memory.id]
+                    result["reason"] = f"LLM判定需覆盖: {llm_result['reason']} (相似度: {highest_similarity:.2f})"
+                
+                elif suggested_action == "VERSION":
+                    _, new_version = self.version_manager.create_version(
+                        most_similar_memory, new_memory.value, llm_result['reason']
+                    )
+                    result["action"] = "VERSION"
+                    result["final_memory"] = new_version
+                    result["deprecated_ids"] = [most_similar_memory.id]
+                    result["reason"] = f"LLM判定需版本化: {llm_result['reason']} (相似度: {highest_similarity:.2f})"
+                
+                else:  # ADD
+                    result["action"] = "ADD"
+                    result["reason"] = f"LLM判定为新记忆: {llm_result['reason']} (相似度: {highest_similarity:.2f})"
+            else:
+                # LLM 判定不相关或置信度低
+                result["action"] = "ADD"
+                result["reason"] = f"LLM判定不相关或置信度低 (相似度: {highest_similarity:.2f}, 置信度: {llm_result['confidence']:.2f})"
+        
+        # Step 5: 极低相似（< llm_judge_threshold）：直接作为新记忆添加
         else:
             result["action"] = "ADD"
             result["reason"] = f"与已有记忆相似度较低 ({highest_similarity:.2f})，作为新记忆添加"
         
         if self.config.verbose:
-            print(f"[MemoryUpdater] 决策: {result['action']} - {result['reason']}")
+            print(f"[MemoryUpdater] 最终决策: {result['action']} - {result['reason']}")
         
         return result
     

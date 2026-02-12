@@ -13,6 +13,7 @@ try:
     from .version_manager import MemoryVersionManager
     from .conflict_resolver import ConflictResolver
     from .forgetter import MemoryForgetter
+    from .semantic_judge import SemanticRelationJudge
     from .updater import MemoryUpdater, update_memory
 except ImportError:
     from update.data_structures import ConflictType, ConflictRecord, UpdateResult
@@ -21,6 +22,7 @@ except ImportError:
     from update.version_manager import MemoryVersionManager
     from update.conflict_resolver import ConflictResolver
     from update.forgetter import MemoryForgetter
+    from update.semantic_judge import SemanticRelationJudge
     from update.updater import MemoryUpdater, update_memory
 
 __all__ = [
@@ -34,6 +36,7 @@ __all__ = [
     "MemoryVersionManager",
     "ConflictResolver",
     "MemoryForgetter",
+    "SemanticRelationJudge",
     # 主类
     "MemoryUpdater",
     "update_memory",
