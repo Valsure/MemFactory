@@ -14,6 +14,7 @@ import sys
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
+import ipdb
 
 # Import mem_utils and src.common
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -59,28 +60,52 @@ class MemoryDataset(Dataset):
     def __init__(self, data_path, tokenizer):
         self.data = []
         if os.path.exists(data_path):
-            try:
-                df = pd.read_parquet(data_path)
-                for _, row in df.iterrows():
-                    context = row['context']
-                    extra_info = row['extra_info']
-                    prompt = row['prompt']
-                    reward_model = row['reward_model']
-                    
-                    # Pre-encode context as requested
-                    context_ids = tokenizer.encode(context, add_special_tokens=False)
-                    
-                    self.data.append({
-                        'context_ids': context_ids,
-                        'context': context,
-                        'question': extra_info.get('question', ''),
-                        'extra_info': extra_info,
-                        'prompt': prompt,
-                        'ground_truth': reward_model.get('ground_truth', ''),
-                        'reward_model': reward_model
-                    })
-            except Exception as e:
-                print(f"Error loading parquet file: {e}")
+            if data_path.endswith('.json'):
+                try:
+                    with open(data_path, 'r', encoding='utf-8') as f:
+                        data_list = json.load(f)
+                    for item in data_list:
+                        context = item.get('context', '')
+                        question = item.get('input', '')
+                        answers = item.get('answers', [])
+                        assert len(answers) == 1, "Error"
+                        # Pre-encode context as requested
+                        context_ids = tokenizer.encode(context, add_special_tokens=False)
+                        
+                        self.data.append({
+                            'context_ids': context_ids,
+                            'context': context,
+                            'question': question,
+                            'extra_info': {'question': question},
+                            'prompt': question,
+                            'ground_truth': answers[0],
+                            'reward_model': {'ground_truth': answers}
+                        })
+                except Exception as e:
+                    print(f"Error loading json file: {e}")
+            else:
+                try:
+                    df = pd.read_parquet(data_path)
+                    for _, row in df.iterrows():
+                        context = row['context']
+                        extra_info = row['extra_info']
+                        prompt = row['prompt']
+                        reward_model = row['reward_model']
+                        
+                        # Pre-encode context as requested
+                        context_ids = tokenizer.encode(context, add_special_tokens=False)
+                        
+                        self.data.append({
+                            'context_ids': context_ids,
+                            'context': context,
+                            'question': extra_info.get('question', ''),
+                            'extra_info': extra_info,
+                            'prompt': prompt,
+                            'ground_truth': reward_model.get('ground_truth', ''),
+                            'reward_model': reward_model
+                        })
+                except Exception as e:
+                    print(f"Error loading parquet file: {e}")
         else:
             print(f"Warning: {data_path} not found.")
             assert False, f"{data_path} not found."
@@ -121,8 +146,11 @@ class MemGRPOTrainer:
         # BFloat16 does not need GradScaler
         self.scaler = torch.amp.GradScaler() if (self.args.device == 'cuda' and self.model.dtype != torch.bfloat16) else None
         
-        # Initialize Evaluator
-        self.evaluator = mem_utils.MemoryEvaluator()
+        # Initialize Evaluator (no need in MemAgent-EndtoEnd)
+        # self.evaluator = mem_utils.MemoryEvaluator()
+        
+        # Initialize LLM Client for evaluation
+        self.llm_client = mem_utils.LLMClient()
 
     def get_tokenizer(self, tokenizer):
         tokenizer.padding_side = "left"
@@ -154,8 +182,8 @@ class MemGRPOTrainer:
         # Iterate over each sample in the batch (even if batch_size > 1)
         # Note: batch_data is a dict of lists (collate_fn)
         bs = len(batch_data['context_ids'])
-        chunk_size = 512 # Define a reasonable chunk size
-        max_chunk_number = 8
+        chunk_size = 2048 # Define a reasonable chunk size
+        max_chunk_number = 5
 
         for i in range(bs):
             context_ids = batch_data['context_ids'][i] # List[int]
@@ -209,6 +237,11 @@ class MemGRPOTrainer:
                 for j in range(num_generations):
                     response_text = generated_texts[j]
                     memories[j] = response_text
+                    if "<think>" in response_text:
+                        if "</think>" in response_text:
+                            memories[j] = response_text.split("</think>")[-1].strip()
+                        else:
+                            memories[j] = response_text[-100:].strip()
                     # Store (prompt, response)
                     trajectories[j].append((formatted_prompts[j], response_text))
             
@@ -232,16 +265,23 @@ class MemGRPOTrainer:
             generated_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
             
             # 5. Evaluation and Group Advantage Calculation
-            scores = []
+            # Batch Evaluation for speed up
+            responses_to_eval = []
             
             for j in range(num_generations):
                 final_response = generated_texts[j]
                 # Add final turn to trajectory
                 trajectories[j].append((formatted_final_prompts[j], final_response))
-                
-                # Evaluate
-                score = mem_utils.evaluate_memory_agent(final_response, ground_truth)
-                scores.append(score)
+                responses_to_eval.append(final_response)
+            # Parallel evaluation
+            # Use max_workers=num_generations to fully parallelize within the group
+            scores = mem_utils.evaluate_memory_agent_batch(
+                responses_to_eval, 
+                [ground_truth] * num_generations, 
+                [question] * num_generations,
+                max_workers=min(32, num_generations),
+                llm_client=self.llm_client
+            )
 
             # Convert to tensor for statistics
             scores_tensor = torch.tensor(scores, dtype=torch.float32, device=self.args.device)
@@ -274,7 +314,6 @@ class MemGRPOTrainer:
 
     def generate_samples(self, batch_data):
         self.model.eval()
-        assert len(batch_data) == 1, "we advice use bs=1 yet"
         # 1. Run LLM Loop to get raw data
         # results: List of (prompt_text, response_text, advantage_score)
         results = self.run_llm_loop(batch_data)
@@ -283,78 +322,64 @@ class MemGRPOTrainer:
             return None
 
         # 2. Tokenize and Collect Data
-        all_input_ids = []
-        all_attention_masks = []
-        all_action_masks = []
-        all_advantages = []
-        
-        # We need to tokenize again to get lengths for masking
-        # Optimization: run_llm_loop could return ids, but text is safer for now
-        
-        for prompt, response, advantage in results:
-            # Tokenize Prompt and Response
-            prompt_ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-            response_ids = self.tokenizer.encode(response, add_special_tokens=False)
-            
-            # Create concatenated sequence
-            # Format: [Prompt, Response]
-            seq_ids = prompt_ids + response_ids
-            
-            # Store raw data for padding later
-            all_input_ids.append(torch.tensor(seq_ids, dtype=torch.long))
-            all_advantages.append(advantage)
-            
-            # Create Masks (pre-padding)
-            # Attention Mask: All 1s for now
-            att_mask = torch.ones(len(seq_ids), dtype=torch.long)
-            all_attention_masks.append(att_mask)
-            
-            # Action Mask: 0 for Prompt, 1 for Response
-            act_mask = torch.zeros(len(seq_ids), dtype=torch.bool) # BoolTensor
-            act_mask[len(prompt_ids):] = True
-            all_action_masks.append(act_mask)
+        prompts_ids = [self.tokenizer.encode(p, add_special_tokens=False) for p, r, a in results]
+        responses_ids = [self.tokenizer.encode(r, add_special_tokens=False) + [self.tokenizer.eos_token_id] for p, r, a in results]
+        advantages = [a for p, r, a in results]
 
-        # 3. Global Padding (Left Padding)
-        # Pad sequence is: [PAD, ..., PAD, Prompt, Response]
-        # This keeps the Prompt+Response contiguity intact at the end
+        # 3. Pad Prompts (Left Padding)
+        max_p_len = max(len(ids) for ids in prompts_ids)
+        padded_prompts = []
+        prompt_masks = []
         
-        # Use pad_sequence for right padding first, then we might need to flip or handle left padding manually?
-        # Actually, torch.nn.utils.rnn.pad_sequence does right padding. 
-        # For Left Padding, we can reverse, pad right, then reverse back.
-        
-        def left_pad_sequence(sequences, batch_first=True, padding_value=0):
-            assert batch_first, "if not [bs, len], will cause fatal error!!!"
-            reversed_sequences = [seq.flip(0) for seq in sequences]
-            padded_reversed = torch.nn.utils.rnn.pad_sequence(reversed_sequences, batch_first=batch_first, padding_value=padding_value)
-            return padded_reversed.flip(1)
+        for p_ids in prompts_ids:
+            pad_len = max_p_len - len(p_ids)
+            # Left Pad
+            padded_p = [self.tokenizer.pad_token_id] * pad_len + p_ids
+            # Attention Mask: 0 for Pad, 1 for Prompt
+            mask_p = [0] * pad_len + [1] * len(p_ids)
+            padded_prompts.append(padded_p)
+            prompt_masks.append(mask_p)
 
-        pad_token_id = self.tokenizer.pad_token_id
+        # 4. Pad Responses (Right Padding)
+        max_r_len = max(len(ids) for ids in responses_ids)
+        padded_responses = []
+        response_masks = [] # Action Mask part
+        response_att_masks = [] # Attention Mask part
+
+        for r_ids in responses_ids:
+            pad_len = max_r_len - len(r_ids)
+            # Right Pad
+            padded_r = r_ids + [self.tokenizer.pad_token_id] * pad_len
+            # Action Mask: 1 for Real Response, 0 for Pad
+            mask_r = [1] * len(r_ids) + [0] * pad_len
+            # Attention Mask: 1 for Real Response, 0 for Pad
+            att_mask_r = [1] * len(r_ids) + [0] * pad_len
+            
+            padded_responses.append(padded_r)
+            response_masks.append(mask_r)
+            response_att_masks.append(att_mask_r)
+
+        # 5. Concat and Tensorize
+        input_ids = torch.tensor([p + r for p, r in zip(padded_prompts, padded_responses)], device=self.args.device, dtype=torch.long)
+        attention_mask = torch.tensor([p + r for p, r in zip(prompt_masks, response_att_masks)], device=self.args.device, dtype=torch.long)
+        # Action Mask: Only Response part [Batch, max_r_len]
+        # This aligns with our new logic where action_mask length == num_actions
+        action_mask = torch.tensor(response_masks, device=self.args.device, dtype=torch.bool)
+        assert(max_r_len == action_mask.size(1))
+        assert(attention_mask.size(1) == input_ids.size(1))
+        advantages_tensor = torch.tensor(advantages, dtype=torch.float32, device=self.args.device)
         
-        # Pad Input IDs
-        padded_input_ids = left_pad_sequence(all_input_ids, batch_first=True, padding_value=pad_token_id).to(self.args.device)
-        
-        # Pad Attention Mask (0 for Pad)
-        padded_attention_mask = left_pad_sequence(all_attention_masks, batch_first=True, padding_value=0).to(self.args.device)
-        
-        # Pad Action Mask (0/False for Pad)
-        # Note: Padding should be False (no loss on pads)
-        padded_action_mask = left_pad_sequence(all_action_masks, batch_first=True, padding_value=False).to(self.args.device)
-        
-        # Advantages to Tensor
-        advantages_tensor = torch.tensor(all_advantages, dtype=torch.float32, device=self.args.device)
-        
-        # 4. Construct Single Samples Object
-        # Note: We are flattening everything into a single large batch
+        # 6. Construct Single Samples Object
         samples = Samples(
-            prompt_response_ids=padded_input_ids,
+            prompt_response_ids=input_ids,
             response_ids=None, # Not used in new logic
             prompt=None, # Not used
             answer=None, # Not used
-            attention_mask=padded_attention_mask,
-            action_mask=padded_action_mask,
-            num_actions=padded_action_mask.sum(dim=1), # Number of action tokens
-            response_length=padded_action_mask.sum(dim=1),
-            prompt_length=padded_attention_mask.sum(dim=1) - padded_action_mask.sum(dim=1),
+            attention_mask=attention_mask,
+            action_mask=action_mask,
+            num_actions=max_r_len, # Scalar representing the fixed window size for response part
+            response_length=action_mask.sum(dim=1),
+            prompt_length=torch.tensor([max_p_len]*len(results), device=self.args.device),
             step_type='extraction', # Generic type
             rewards=advantages_tensor
         )
@@ -400,15 +425,16 @@ class MemGRPOTrainer:
                 # Slice the batch
                 mini_ids = samples.prompt_response_ids[i:end_i]
                 mini_mask = samples.attention_mask[i:end_i]
-                mini_num_actions = samples.num_actions[i:end_i]
                 
                 # Compute old log probs
-                mini_old_lp = self.get_action_log_probs(self.model, mini_ids, mini_mask, mini_num_actions)
+                mini_old_lp = self.get_action_log_probs(self.model, mini_ids, mini_mask, samples.num_actions)
+                # Assert: Log Probs length equals num_actions
+                assert mini_old_lp.size(1) == samples.num_actions, f"Log Probs length {mini_old_lp.size(1)} != num_actions {samples.num_actions}"
                 all_old_log_probs.append(mini_old_lp)
                 
                 # Compute ref log probs
                 if self.ref_model:
-                    mini_ref_lp = self.get_action_log_probs(self.ref_model, mini_ids, mini_mask, mini_num_actions)
+                    mini_ref_lp = self.get_action_log_probs(self.ref_model, mini_ids, mini_mask, samples.num_actions)
                     all_ref_log_probs.append(mini_ref_lp)
 
         # Concatenate results
@@ -446,9 +472,20 @@ class MemGRPOTrainer:
         prompt_response_ids = inputs['prompt_response_ids']
         attention_mask = inputs['attention_mask']
         action_mask = inputs['action_mask']
-        num_actions = action_mask.size(1)
+        # Recalculate num_actions from the shape of old_action_log_probs 
+        # (since we don't pass samples object here, but we know old_log_probs is [B, num_actions])
+        num_actions = inputs['old_action_log_probs'].size(1)
         
+        # 1. Get Log Probs for Response part only [B, num_actions]
         action_log_probs = self.get_action_log_probs(model, prompt_response_ids, attention_mask, num_actions)
+        
+        # 2. Action Mask is already [B, num_actions]
+        
+        # 3. Safety Check
+        assert action_mask.size(1) == num_actions, f"Action Mask length {action_mask.size(1)} != num_actions {num_actions}"
+        assert action_log_probs.size(1) == num_actions, f"Log Probs length {action_log_probs.size(1)} != num_actions {num_actions}"
+        assert action_log_probs.shape == action_mask.shape, \
+            f"Shape mismatch: LogProbs {action_log_probs.shape} vs Mask {action_mask.shape}"
         
         k3 = None
         if self.args.beta != 0.0 and inputs.get('ref_action_log_probs') is not None:
@@ -603,9 +640,6 @@ if __name__ == "__main__":
     parser.add_argument("--max_generate_length", type=int, default=4096, help="Max generate length")
     parser.add_argument("--wandb_name", type=str, default=None, help="SwanLab experiment name")
     
-    # Add training mode arguments
-    parser.add_argument("--no_train_extraction", action="store_true", help="Disable training extraction")
-    parser.add_argument("--no_train_update", action="store_true", help="Disable training update")
     
     # Parse known args to allow passing other args if needed
     args, unknown = parser.parse_known_args()
@@ -639,13 +673,11 @@ if __name__ == "__main__":
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         lr=args.lr,
         beta=args.beta,
-        num_generations=4, # Group size
+        num_generations=16, # Group size
         save_steps=args.save_steps,
-        epoch=2,
-        max_prompt_length=3072,
+        epoch=4,
+        max_prompt_length=4096,
         max_generate_length=args.max_generate_length,
-        train_extraction=not args.no_train_extraction,
-        train_update=not args.no_train_update
     )
     os.environ["SWANLAB_API_KEY"] = "Zkrggz0kWlnEuNRu5r4dz"
     swanlab.init(
