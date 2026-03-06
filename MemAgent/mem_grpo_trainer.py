@@ -386,12 +386,59 @@ class MemGRPOTrainer:
             
         return samples
 
-    def get_action_log_probs(self, model, input_ids, attention_mask, num_actions):
+    def get_action_log_probs_legacy(self, model, input_ids, attention_mask, num_actions):
+        """Legacy implementation for verification"""
         output = model(input_ids, attention_mask=attention_mask, use_cache=False)
         logits = output.logits
         log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
         log_probs_labels = log_probs.gather(dim=-1, index=input_ids[:, 1:].unsqueeze(-1))
         action_log_probs = log_probs_labels.squeeze(-1)[:, -num_actions:]
+        return action_log_probs
+
+    def get_action_log_probs(self, model, input_ids, attention_mask, num_actions):
+        # 1. New efficient implementation（需要测试和验证, done , 应该是可以用的）
+        output = model(input_ids, attention_mask=attention_mask, use_cache=False)
+        logits = output.logits
+        
+        # Memory Optimization: Use CrossEntropyLoss to avoid creating the huge log_softmax tensor
+        # log_prob(x) = - cross_entropy(logits, target)
+        
+        # Shift logits and input_ids for next-token prediction
+        shift_logits = logits[:, :-1, :].contiguous()
+        shift_labels = input_ids[:, 1:].contiguous()
+        
+        # Flatten to [Batch * SeqLen, Vocab] for cross_entropy
+        flat_logits = shift_logits.view(-1, shift_logits.size(-1))
+        flat_labels = shift_labels.view(-1)
+        
+        # Compute negative log likelihood
+        # reduction='none' gives us the loss per token
+        per_token_nll = F.cross_entropy(flat_logits, flat_labels, reduction='none')
+        
+        # Reshape back to [Batch, SeqLen] and negate to get log_probs
+        log_probs_labels = -per_token_nll.view(shift_labels.size())
+        
+        # Take only the last num_actions tokens
+        action_log_probs = log_probs_labels[:, -num_actions:]
+        
+        # # 2. Verification with legacy implementation (Optional, can be disabled for speed)
+        # # note : set bs < 4 to avoid OOM !!! because of extra mem cost
+        # if os.environ.get("VERIFY_LOGPROBS", "0") == "1":
+        #     with torch.no_grad():
+        #         legacy_log_probs = self.get_action_log_probs_legacy(model, input_ids, attention_mask, num_actions)
+                
+        #         diff = (action_log_probs - legacy_log_probs).abs().max()
+        #         print(f"LogProb Diff: {diff.item():.6f}")
+                
+        #         if diff > 1e-4:
+        #             print("CRITICAL WARNING: LogProb mismatch!")
+        #             print("New:", action_log_probs[0, :5])
+        #             print("Old:", legacy_log_probs[0, :5])
+        #             assert False
+                
+        #         del legacy_log_probs
+        #         torch.cuda.empty_cache()
+
         return action_log_probs
 
     def generate_experiences(self, batch_data):
@@ -412,7 +459,8 @@ class MemGRPOTrainer:
         }
         
         # Calculate Log Probs in Mini-batches to save memory
-        inference_batch_size = 12 # Adjust based on GPU memory
+        # Reduced from 12 to 2 to prevent OOM on long sequences
+        inference_batch_size = 4 
         total_samples = samples.prompt_response_ids.size(0)
         
         all_old_log_probs = []
@@ -517,7 +565,8 @@ class MemGRPOTrainer:
         model.train()
         
         # Mini-batching for training
-        training_batch_size = 8 # Adjust based on GPU memory
+        # Reduced from 8 to 4 to prevent OOM during backward pass
+        training_batch_size = 4 
         total_samples = inputs['prompt_response_ids'].size(0)
         
         total_loss = 0.0

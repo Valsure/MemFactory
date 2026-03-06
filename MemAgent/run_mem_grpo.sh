@@ -7,9 +7,11 @@ set -x
 
 # 1. Paths
 # The user specified data path relative to MemAgent directory
+# Note: 目前看来 Qwen3 系列的训练效果好，Qwen2.5 则不好。
 DATA_PATH="./data/eval_50.json" 
-# The user specified model path
-MODEL_PATH="/home/models/Qwen3-4B-Instruct"
+MODEL_NAME="Qwen2.5-3B-Instruct"
+MODEL_PATH="/home/models/${MODEL_NAME}"
+MODEL_TAG="${MODEL_NAME//\//_}"
 # Output directory
 OUTPUT_DIR="./output/mem_grpo_qwen3_4b"
 
@@ -31,11 +33,11 @@ OUTPUT_DIR="./output/mem_grpo_qwen3_4b"
 #
 # If you were running 8 independent processes (DDP), you would set this to 16.
 # But the script doesn't support DDP out of the box.
-GRAD_ACC_STEPS=8
+GRAD_ACC_STEPS=24
 
 # 3. Hyperparameters
 # Matched to reference script where possible.
-LR=1e-6                # Reference: actor_rollout_ref.actor.optim.lr=1e-6
+LR=5e-6                # Reference: actor_rollout_ref.actor.optim.lr=1e-6
 BETA=0.001             # Reference: algorithm.kl_ctrl.kl_coef=0.001 (default in script is 0.1)
 MAX_GEN_LEN=3072       # Reference: MAX_NEW_TOKEN=1024 (default in script is 4096)
 SAVE_STEPS=1000         # Adjusted for frequent saving. Reference save_freq=10.
@@ -47,7 +49,7 @@ SAVE_STEPS=1000         # Adjusted for frequent saving. Reference save_freq=10.
 # Ensure we are in the directory containing the script if running relatively
 # cd "$(dirname "$0")"
 
-echo "Starting training with Model: $MODEL_PATH, Data: $DATA_PATH"
+echo "Starting training with Model: $MODEL_NAME ($MODEL_PATH), Data: $DATA_PATH"
 echo "Gradient Accumulation Steps: $GRAD_ACC_STEPS to match Global BS=128"
 
 python3 mem_grpo_trainer.py \
@@ -59,7 +61,7 @@ python3 mem_grpo_trainer.py \
     --gradient_accumulation_steps "$GRAD_ACC_STEPS" \
     --max_generate_length "$MAX_GEN_LEN" \
     --save_steps "$SAVE_STEPS" \
-    --wandb_name "mem_agent_qwen3_4b"
+    --wandb_name "mem_agent_${MODEL_TAG}_acc_steps${GRAD_ACC_STEPS}_lr${LR}"
 
 # Note on hardcoded parameters in mem_grpo_trainer.py that cannot be changed via CLI:
 # - epoch: Hardcoded to 2. Reference uses 30.
