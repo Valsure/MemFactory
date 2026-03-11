@@ -8,7 +8,7 @@ set -x
 # 1. Paths
 # Assuming same model and output structure
 DATA_PATH="./datas/train.jsonl" # Use the train data from reference code context
-MODEL_NAME="Qwen2.5-3B"
+MODEL_NAME="Qwen2.5-3B-Instruct"
 MODEL_PATH="/home/models/${MODEL_NAME}"
 OUTPUT_DIR="./output/mem_r1_qwen25_3b"
 
@@ -58,4 +58,5 @@ python3 examples/train_mem_grpo.py \
     --agent_type "$AGENT_TYPE" \
     --wandb_name "mem_r1_${AGENT_TYPE}_${ENV_TYPE}_${MODEL_NAME}" \
     --train_extraction \
+    --train_update \
     --epoch "$EPOCHS"
