@@ -374,9 +374,9 @@ class MemoryEvaluator:
             # Since we validated above, it should be fine.
             
             update_err_flag = self.apply_update_plan(context_memory, upd_json, extraction_output)
-            if update_err_flag:
-                update_reward = 0
-
+            # if update_err_flag:
+            #     update_reward = 0
+            import pdb;pdb.set_trace()
             # 5. Retrieval
             retrieved_docs = self.retrieve(query, top_k=30)
             context_str = "\n".join([f"- {m.key}: {m.value}" for m in retrieved_docs])

@@ -14,12 +14,6 @@ import random
 import sys
 from tqdm import tqdm
 import numpy as np
-try:
-    from vllm import LLM, SamplingParams
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
-    print("Warning: vLLM not available, falling back to PyTorch generate")
 
 # Import mem_utils and src.common
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -60,11 +54,6 @@ class MemGRPOArguments:
     train_extraction: bool = True
     train_update: bool = True
     gradient_checkpointing: bool = True
-    # vLLM configuration
-    use_vllm: bool = False
-    model_path: Optional[str] = None
-    vllm_gpu_memory_utilization: float = 0.8
-    vllm_tensor_parallel_size: int = 1
 
 class MemoryDataset(Dataset):
     def __init__(self, data_path, tokenizer):
@@ -137,51 +126,7 @@ class MemGRPOTrainer:
             self.model.gradient_checkpointing_enable()
             
         self.tokenizer = self.get_tokenizer(tokenizer)
-        # Initialize vLLM engine if available
-        self.vllm_engine = None
-        
-        # FORCE DISABLE VLLM to avoid training with frozen model
-        if hasattr(args, 'use_vllm') and args.use_vllm:
-            print("WARNING: VLLM has been forcibly disabled. Using VLLM during training causes the model to generate with frozen weights instead of updated weights. Falling back to PyTorch generation.")
-            self.args.use_vllm = False
 
-        # import pdb;pdb.set_trace()
-        if False and VLLM_AVAILABLE and hasattr(args, 'use_vllm') and args.use_vllm:
-            try:
-                # 获取模型路径 - 支持多种来源
-                model_path = None
-                if hasattr(model, 'config') and hasattr(model.config, '_name_or_path'):
-                    model_path = model.config._name_or_path
-                elif hasattr(args, 'model_path') and args.model_path:
-                    model_path = args.model_path
-                elif isinstance(model, str):
-                    model_path = model
-                
-                if model_path:
-                    sampling_params = SamplingParams(
-                        temperature=1.0,
-                        max_tokens=self.args.max_generate_length,
-                        stop_token_ids=[self.tokenizer.eos_token_id]
-                    )
-  
-                    tokenizer_path = model_path 
-                    
-                    self.vllm_engine = LLM(
-                        model=model_path,
-                        tokenizer=tokenizer_path,  # 传入字符串路径
-                        trust_remote_code=True,
-                        dtype="auto",
-                        tensor_parallel_size=self.args.vllm_tensor_parallel_size,
-                        gpu_memory_utilization=self.args.vllm_gpu_memory_utilization
-                    )
-                    self.vllm_sampling_params = sampling_params
-                    print(f"Successfully initialized vLLM engine with model: {model_path}")
-                else:
-                    print("Warning: Could not determine model path for vLLM initialization")
-            except Exception as e:
-                print(f"Warning: Failed to initialize vLLM engine: {e}")
-                self.vllm_engine = None
-        
         self.ref_model = ref_model
         if self.ref_model is None and self.args.beta != 0.0:
             self.ref_model = deepcopy(model)
@@ -224,45 +169,7 @@ class MemGRPOTrainer:
     def construct_update_prompt(self, context_memory, extraction_output):
         return mem_utils.construct_update_prompt(context_memory, extraction_output)
 
-    def _generate_with_vllm(self, prompts: List[str]) -> Tuple[List[str], torch.Tensor]:
-        """Generate responses using vLLM engine"""
-        if not self.vllm_engine:
-            raise RuntimeError("vLLM engine not initialized")
-        
-        # Apply chat template to prompts
-        msgs_list = [[{"role": "user", "content": p}] for p in prompts]
-        formatted_prompts = [self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False) 
-                           for m in msgs_list]
-        
-        # Generate with vLLM
-        outputs = self.vllm_engine.generate(formatted_prompts, self.vllm_sampling_params)
-        
-        # Extract generated texts and convert to token IDs
-        generated_texts = []
-        generated_token_ids = []
-        
-        for output in outputs:
-            # Get the generated text (excluding prompt)
-            generated_text = output.outputs[0].text
-            generated_texts.append(generated_text)
-            
-            # Convert to token IDs
-            token_ids = self.tokenizer.encode(generated_text, add_special_tokens=False)
-            generated_token_ids.append(torch.tensor(token_ids, device=self.args.device))
-        
-        # Pad sequences to same length
-        max_len = max(len(ids) for ids in generated_token_ids)
-        padded_token_ids = []
-        for ids in generated_token_ids:
-            pad_len = max_len - len(ids)
-            padded_ids = F.pad(ids, (0, pad_len), value=self.tokenizer.pad_token_id)
-            padded_token_ids.append(padded_ids)
-        
-        token_ids_tensor = torch.stack(padded_token_ids)
-        return generated_texts, token_ids_tensor
-
     def _generate_with_pytorch(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Fallback generation using PyTorch model.generate"""
         with torch.no_grad():
             outputs = self.model.generate(
                 input_ids=input_ids,
@@ -285,54 +192,25 @@ class MemGRPOTrainer:
         # --- Step 1: Extraction ---
         prompts_ext = [self.construct_extraction_prompt(fact) for fact in batch_data['fact']]
         
-        # Use vLLM for extraction if available, otherwise fall back to PyTorch
-        if self.vllm_engine:
-            # Prepare prompts for batch generation
-            text_ext_batch = []
-            for prompt in prompts_ext:
-                text_ext_batch.extend([prompt] * num_generations)
-            # import pdb; pdb.set_trace()
-            # Generate with vLLM
-            resp_texts_ext, resp_ids_ext_raw = self._generate_with_vllm(text_ext_batch)
-            # Format outputs similar to PyTorch generate
-            # Create dummy input tensors for compatibility
-            dummy_inputs = self.tokenizer(text_ext_batch, 
+
+        msgs_ext_list = [[{"role": "user", "content": p}] for p in prompts_ext]
+        text_ext_list = [self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False) for m in msgs_ext_list]
+        
+        # Repeat prompts for num_generations
+        text_ext_batch = []
+        for t in text_ext_list:
+            text_ext_batch.extend([t] * num_generations)
+        # import pdb; pdb.set_trace()
+        tokenized_ext = self.tokenizer(text_ext_batch, 
                                         padding='longest', 
                                         max_length=self.args.max_prompt_length, 
                                         truncation=True, 
                                         return_tensors='pt').to(self.args.device)
-
-            
-            prompt_len_ext = dummy_inputs['input_ids'].size(1)
-            # Combine prompt + response for compatibility
-            ext_outputs_list = []
-            for i, (prompt_input, resp_ids) in enumerate(zip(dummy_inputs['input_ids'], resp_ids_ext_raw)):
-                combined = torch.cat([prompt_input, resp_ids], dim=0)
-                ext_outputs_list.append(combined)
-            
-            ext_outputs = torch.stack(ext_outputs_list)
-            resp_ids_ext = resp_ids_ext_raw
-            
-        else:
-            # Original PyTorch generation logic
-            msgs_ext_list = [[{"role": "user", "content": p}] for p in prompts_ext]
-            text_ext_list = [self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False) for m in msgs_ext_list]
-            
-            # Repeat prompts for num_generations
-            text_ext_batch = []
-            for t in text_ext_list:
-                text_ext_batch.extend([t] * num_generations)
-            # import pdb; pdb.set_trace()
-            tokenized_ext = self.tokenizer(text_ext_batch, 
-                                         padding='longest', 
-                                         max_length=self.args.max_prompt_length, 
-                                         truncation=True, 
-                                         return_tensors='pt').to(self.args.device)
-            
-            ext_outputs = self._generate_with_pytorch(tokenized_ext['input_ids'], tokenized_ext['attention_mask'])
-            prompt_len_ext = tokenized_ext['input_ids'].size(1)
-            resp_ids_ext = ext_outputs[:, prompt_len_ext:]
-            resp_texts_ext = self.tokenizer.batch_decode(resp_ids_ext, skip_special_tokens=True)
+        
+        ext_outputs = self._generate_with_pytorch(tokenized_ext['input_ids'], tokenized_ext['attention_mask'])
+        prompt_len_ext = tokenized_ext['input_ids'].size(1)
+        resp_ids_ext = ext_outputs[:, prompt_len_ext:]
+        resp_texts_ext = self.tokenizer.batch_decode(resp_ids_ext, skip_special_tokens=True)
 
         # Organize Extraction Samples
         if self.args.train_extraction:
@@ -370,42 +248,20 @@ class MemGRPOTrainer:
                 global_idx = i * num_generations + j
                 prompts_upd.append(self.construct_update_prompt(ctx_mem, resp_texts_ext[global_idx]))
 
-        # Use vLLM for update generation if available, otherwise fall back to PyTorch
-        if self.vllm_engine:
-            # Generate with vLLM
-            resp_texts_upd, resp_ids_upd_raw = self._generate_with_vllm(prompts_upd)
-            
-            # Format outputs
-            dummy_inputs_upd = self.tokenizer(prompts_upd,
-                                            padding='longest',
-                                            max_length=self.args.max_prompt_length,
-                                            truncation=True,
-                                            return_tensors='pt').to(self.args.device)
-            
-            prompt_len_upd = dummy_inputs_upd['input_ids'].size(1)
-            upd_outputs_list = []
-            for i, (prompt_input, resp_ids) in enumerate(zip(dummy_inputs_upd['input_ids'], resp_ids_upd_raw)):
-                combined = torch.cat([prompt_input, resp_ids], dim=0)
-                upd_outputs_list.append(combined)
-            
-            upd_outputs = torch.stack(upd_outputs_list)
-            resp_ids_upd = resp_ids_upd_raw
-            
-        else:
-            # Original PyTorch generation logic
-            msgs_upd_list = [[{"role": "user", "content": p}] for p in prompts_upd]
-            text_upd_list = [self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False) for m in msgs_upd_list]
-            
-            tokenized_upd = self.tokenizer(text_upd_list,
-                                         padding='longest',
-                                         max_length=self.args.max_prompt_length,
-                                         truncation=True,
-                                         return_tensors='pt').to(self.args.device)
-            
-            upd_outputs = self._generate_with_pytorch(tokenized_upd['input_ids'], tokenized_upd['attention_mask'])
-            prompt_len_upd = tokenized_upd['input_ids'].size(1)
-            resp_ids_upd = upd_outputs[:, prompt_len_upd:]
-            resp_texts_upd = self.tokenizer.batch_decode(resp_ids_upd, skip_special_tokens=True)
+
+        msgs_upd_list = [[{"role": "user", "content": p}] for p in prompts_upd]
+        text_upd_list = [self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False) for m in msgs_upd_list]
+        
+        tokenized_upd = self.tokenizer(text_upd_list,
+                                        padding='longest',
+                                        max_length=self.args.max_prompt_length,
+                                        truncation=True,
+                                        return_tensors='pt').to(self.args.device)
+        
+        upd_outputs = self._generate_with_pytorch(tokenized_upd['input_ids'], tokenized_upd['attention_mask'])
+        prompt_len_upd = tokenized_upd['input_ids'].size(1)
+        resp_ids_upd = upd_outputs[:, prompt_len_upd:]
+        resp_texts_upd = self.tokenizer.batch_decode(resp_ids_upd, skip_special_tokens=True)
 
         # Calculate Rewards (requires iterating through batch and generations)
         all_rewards = []
@@ -667,12 +523,8 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name_or_path", type=str, default="/home/models/Qwen3-1.7B", help="Path to the model")
-    parser.add_argument("--data_path", type=str, default="./datas/train.jsonl", help="Path to the training data")
+    parser.add_argument("--data_path", type=str, default="/home/datasets/temp/train.jsonl", help="Path to the training data")
     parser.add_argument("--output_dir", type=str, default="./output/mem_grpo", help="Output directory")
-    parser.add_argument("--use_vllm", action="store_true", help="Use vLLM for faster inference")
-    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9, help="GPU memory utilization for vLLM")
-    parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1, help="Tensor parallel size for vLLM")
-    
     # Parse known args to allow passing other args if needed
     args, unknown = parser.parse_known_args()
     
@@ -706,14 +558,10 @@ if __name__ == "__main__":
         num_generations=4, # Group size
         save_steps=100,
         epoch=2,
-        max_prompt_length=3072,
-        max_generate_length=4096,
+        max_prompt_length=2048,
+        max_generate_length=1024,
         train_extraction=True,
-        train_update=True,
-        use_vllm=False, # Forcibly disable VLLM
-        model_path=args.model_name_or_path,  # 显式设置模型路径
-        vllm_gpu_memory_utilization=getattr(args, 'vllm_gpu_memory_utilization', 0.9),
-        vllm_tensor_parallel_size=getattr(args, 'vllm_tensor_parallel_size', 1)
+        train_update=True
     )
     os.environ["SWANLAB_API_KEY"] = "Zkrggz0kWlnEuNRu5r4dz"
     swanlab.init(
