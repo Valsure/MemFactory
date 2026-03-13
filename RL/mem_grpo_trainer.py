@@ -55,6 +55,12 @@ class MemGRPOArguments:
     train_update: bool = True
     gradient_checkpointing: bool = True
 
+    train_extraction: bool = False
+    train_update: bool = False
+    train_rerank: bool = True  # 新增：控制是否训练 Reranker
+    top_k: int = 10
+
+
 class MemoryDataset(Dataset):
     def __init__(self, data_path, tokenizer):
         self.data = []
@@ -188,7 +194,83 @@ class MemGRPOTrainer:
         
         bs = len(batch_data['fact'])
         num_generations = self.args.num_generations
-        
+
+        # === 新增：Rerank 训练阶段 ===
+        if self.args.train_rerank:
+            prompts_rerank = []
+            top_k_mems_batch = []
+            
+            for i in range(bs):
+                query = batch_data['query'][i]
+                # 模拟 Retriever 召回 Top-K（此处为了简化，可以直接从 context_memory 或通过检索器获取）
+                # 这里假设直接调用 evaluator.retrieve()
+                top_k_mems = self.evaluator.retrieve(query, top_k=self.args.top_k)
+                top_k_mems_batch.append(top_k_mems)
+                
+                candidates_str = "\n".join([f"[ID: {idx+1}] {m.key}: {m.value}" for idx, m in enumerate(top_k_mems)])
+                prompt = mem_utils.RERANK_PROMPT.format(query=query, candidates=candidates_str)
+                prompts_rerank.append(prompt)
+
+            msgs_rerank_list = [[{"role": "user", "content": p}] for p in prompts_rerank]
+            text_rerank_list = [self.tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False) for m in msgs_rerank_list]
+            
+            text_rerank_batch = []
+            for t in text_rerank_list:
+                text_rerank_batch.extend([t] * num_generations)
+
+            tokenized_rerank = self.tokenizer(text_rerank_batch, 
+                                            padding='longest', 
+                                            max_length=self.args.max_prompt_length, 
+                                            truncation=True, 
+                                            return_tensors='pt').to(self.args.device)
+            
+            rerank_outputs = self._generate_with_pytorch(tokenized_rerank['input_ids'], tokenized_rerank['attention_mask'])
+            prompt_len_rerank = tokenized_rerank['input_ids'].size(1)
+            resp_ids_rerank = rerank_outputs[:, prompt_len_rerank:]
+            resp_texts_rerank = self.tokenizer.batch_decode(resp_ids_rerank, skip_special_tokens=True)
+
+            # --- 计算基于引用的 Reward ---
+            all_rerank_rewards = []
+            for i in range(bs):
+                rewards_i = []
+                query = batch_data['query'][i]
+                answer = batch_data['answer'][i]
+                top_k_mems = top_k_mems_batch[i]
+
+                for j in range(num_generations):
+                    global_idx = i * num_generations + j
+                    total_reward, citation_reward = self.evaluator.evaluate_rerank(
+                        query, answer, top_k_mems, resp_texts_rerank[global_idx]
+                    )
+                    rewards_i.append(total_reward)
+                
+                all_rerank_rewards.append(torch.tensor(rewards_i, device=self.args.device, dtype=torch.float32))
+
+            # --- 封装为 GRPO 样本 ---
+            for i in range(bs):
+                start_idx = i * num_generations
+                end_idx = start_idx + num_generations
+                
+                attention_mask_rerank = (rerank_outputs.ne(self.tokenizer.pad_token_id)).long()
+                action_mask_rerank = (resp_ids_rerank.ne(self.tokenizer.eos_token_id) & 
+                                      resp_ids_rerank.ne(self.tokenizer.pad_token_id)).long()
+                
+                samples_rerank = Samples(
+                    prompt_response_ids=rerank_outputs[start_idx:end_idx],
+                    response_ids=resp_ids_rerank[start_idx:end_idx],
+                    prompt=prompts_rerank[i],
+                    answer=batch_data['answer'][i],
+                    attention_mask=attention_mask_rerank[start_idx:end_idx],
+                    action_mask=action_mask_rerank[start_idx:end_idx],
+                    num_actions=action_mask_rerank[start_idx:end_idx].size(1),
+                    response_length=action_mask_rerank[start_idx:end_idx].float().sum(dim=-1),
+                    prompt_length=0,
+                    step_type='rerank',  # 关键：标记阶段为 rerank
+                    rewards=all_rerank_rewards[i]
+                )
+                samples_list.append(samples_rerank)
+
+
         # --- Step 1: Extraction ---
         prompts_ext = [self.construct_extraction_prompt(fact) for fact in batch_data['fact']]
         
@@ -357,7 +439,16 @@ class MemGRPOTrainer:
             "old_action_log_probs": [],
             "ref_action_log_probs": []
         }
-        
+
+        batch_exp_rerank = { 
+            "prompt_response_ids": [],
+            "attention_mask": [],
+            "action_mask": [],
+            "advantages": [],
+            "old_action_log_probs": [],
+            "ref_action_log_probs": []
+        }
+
         for samples in samples_list:
             rewards = samples.rewards
             mean_reward = rewards.mean()
@@ -384,6 +475,8 @@ class MemGRPOTrainer:
                 target_dict = batch_exp_ext
             elif samples.step_type == 'update':
                 target_dict = batch_exp_upd
+            elif samples.step_type == 'rerank':
+                target_dict = batch_exp_rerank # 增加分支       
             else:
                 continue
 
@@ -409,7 +502,8 @@ class MemGRPOTrainer:
             }
         return {
             "extraction": collate_exp(batch_exp_ext),
-            "update": collate_exp(batch_exp_upd)
+            "update": collate_exp(batch_exp_upd),
+            "rerank": collate_exp(batch_exp_rerank)
         }
 
     def compute_loss(self, model, inputs):
@@ -504,6 +598,10 @@ class MemGRPOTrainer:
                         # Train Update
                         if self.args.train_update and experiences["update"] is not None:
                             self.train_step(self.model, experiences["update"], self.optimizer, idx)
+                        
+                        # Train Retrieve
+                        if self.args.train_rerank and experiences.get("rerank") is not None:
+                            self.train_step(self.model, experiences["rerank"], self.optimizer, idx)
                     
                     self.update_steps += 1
                     
@@ -560,8 +658,9 @@ if __name__ == "__main__":
         epoch=2,
         max_prompt_length=2048,
         max_generate_length=1024,
-        train_extraction=True,
-        train_update=True
+        train_extraction=False,
+        train_update=False,
+        train_rerank=True
     )
     os.environ["SWANLAB_API_KEY"] = "Zkrggz0kWlnEuNRu5r4dz"
     swanlab.init(
@@ -572,7 +671,7 @@ if __name__ == "__main__":
     print(f"Loading data from {args.data_path}...")
     # Initialize Dataset
     dataset = MemoryDataset(args.data_path, tokenizer)
-    
+
     if len(dataset) == 0:
         print("Error: Dataset is empty or file not found. Please run 'python scripts/process_locomo.py' first.")
         assert False
