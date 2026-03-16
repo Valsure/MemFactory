@@ -11,9 +11,9 @@ from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 import numpy as np
-
-# OpenAI API 依赖
 from openai import OpenAI
+# OpenAI API 依赖
+from ..common.utils import LLMClient
 
 
 # =============================================================================
@@ -184,86 +184,6 @@ class Edge:
     relation_type: str
     weight: float = 1.0
     metadata: Dict = field(default_factory=dict)
-
-
-# =============================================================================
-# LLM 服务
-# =============================================================================
-
-class LLMClient:
-    """
-    LLM客户端：封装OpenAI API调用
-    """
-    
-    _instance = None
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-    
-    def __init__(self):
-        if self._initialized:
-            return
-        self.client = OpenAI(
-            api_key=OPENAI_API_KEY,
-            base_url=OPENAI_BASE_URL
-        )
-        self.model = LLM_MODEL
-        self._initialized = True
-        print(f"[LLMClient] 已初始化，模型: {self.model}")
-    
-    def chat(self, system_prompt: str, user_prompt: str, 
-             temperature: float = 0.3) -> str:
-        """
-        调用LLM进行对话
-        
-        Args:
-            system_prompt: 系统提示词
-            user_prompt: 用户输入
-            temperature: 温度参数
-            
-        Returns:
-            LLM响应文本
-        """
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=temperature
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"[LLMClient] API调用失败: {e}")
-            return ""
-    
-    def parse_json(self, response: str) -> Optional[Dict]:
-        """解析JSON响应"""
-        try:
-            # 尝试提取JSON块
-            if "```json" in response:
-                response = response.split("```json")[1].split("```")[0]
-            elif "```" in response:
-                response = response.split("```")[1].split("```")[0]
-            
-            # 清理空白字符
-            response = response.strip()
-            # 处理思维链
-            if response.startswith("<think>"):
-                response = response.split("</think>")[-1]
-                response = response.strip()
-            # 尝试提取JSON对象（处理可能存在的<think>标签或其他前缀）
-            if not response.startswith("{"):
-                print("[LLMClient-parse_json] 回答不是 { 开头无法解析", response[:100])
-
-            return json.loads(response)
-        except json.JSONDecodeError as e:
-            print(f"[LLMClient] JSON解析失败: {e}")
-            return None
 
 
 # =============================================================================

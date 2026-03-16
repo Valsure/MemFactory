@@ -172,6 +172,31 @@ Predicted Answer: {prediction}
 Is the predicted answer consistent with the standard answer? Please output only "True" or "False".
 """
 
+
+RERANK_PROMPT = """You are an expert memory retriever.
+Your task is to select the most relevant memories to answer the user's query.
+
+User Query: {query}
+
+Candidate Memories:
+{candidates}
+
+Select the exact IDs of the most useful memories. Provide your reasoning in <think> tags, then output a JSON list of the selected IDs.
+Example output:
+<think> memory 1 is relevant because... </think>
+[1, 3, 4]
+"""
+
+QA_CITE_PROMPT = """Based on the following memory information, answer the user's question. 
+You MUST cite the exact memory ID when using its information. Use the format [ID].
+
+Context Memories:
+{context}
+
+User Question: {question}
+Answer:"""
+
+
 # =============================================================================
 # Helper Functions
 # =============================================================================
@@ -374,9 +399,9 @@ class MemoryEvaluator:
             # Since we validated above, it should be fine.
             
             update_err_flag = self.apply_update_plan(context_memory, upd_json, extraction_output)
-            if update_err_flag:
-                update_reward = 0
-
+            # if update_err_flag:
+            #     update_reward = 0
+            import pdb;pdb.set_trace()
             # 5. Retrieval
             retrieved_docs = self.retrieve(query, top_k=30)
             context_str = "\n".join([f"- {m.key}: {m.value}" for m in retrieved_docs])
@@ -412,3 +437,59 @@ class MemoryEvaluator:
             accuracy_reward = 0
             
         return extraction_reward, update_reward, accuracy_reward
+
+    def evaluate_rerank(self, query: str, answer: str, top_k_memories: List[MemoryItem], predicted_ids_str: str):
+        """
+        评估 Reranker 的选择，返回基于引用的奖励。
+        """
+        # 1. 解析模型生成的 IDs
+        try:
+            # 提取思维链后的列表
+            if "<think>" in predicted_ids_str and "</think>" in predicted_ids_str:
+                predicted_ids_str = predicted_ids_str.split("</think>")[-1].strip()
+            
+            # 简单正则提取数字列表
+            import re
+            match = re.search(r'\[(.*?)\]', predicted_ids_str)
+            if match:
+                selected_ids = [int(x.strip()) for x in match.group(1).split(',')]
+            else:
+                selected_ids = []
+        except:
+            selected_ids = []
+
+        # 格式惩罚：如果没有选出任何有效 ID，给予负反馈
+        if not selected_ids:
+            return -1.0, 0.0
+
+        # 2. 准备被选中的记忆传给 QA 模型
+        # 假设 top_k_memories 传入时自带临时的 1~K 的 ID
+        selected_mems = [m for idx, m in enumerate(top_k_memories) if (idx + 1) in selected_ids]
+        
+        context_str = "\n".join([f"[ID: {idx+1}] {m.key}: {m.value}" for idx, m in enumerate(top_k_memories) if (idx + 1) in selected_ids])
+
+        # 3. QA 生成回答（带引用）
+        qa_prompt = QA_CITE_PROMPT.format(context=context_str, question=query)
+        pred_answer = self.llm.chat("You are a helpful assistant.", qa_prompt)
+        if "</think>" in pred_answer:
+            pred_answer = pred_answer.split("</think>")[-1].strip()
+
+        # 4. 计算 Citation Reward (论文核心思想)
+        citation_reward = 0.0
+        cited_ids = []
+        
+        # 检测回答中出现了哪些 [ID]
+        for idx in selected_ids:
+            if f"[{idx}]" in pred_answer:
+                citation_reward += 1.0  # +1 (Useful) 
+                cited_ids.append(idx)
+            else:
+                citation_reward -= 1.0  # -1 (Not Useful)
+
+        # 5. 补充准确性奖励 (确保不仅引用了，还答对了)
+        judge_prompt = JUDGE_PROMPT.format(question=query, answer=answer, prediction=pred_answer)
+        judge_result = self.llm.chat("You are an impartial judge.", judge_prompt)
+        accuracy_reward = 2.0 if "True" in judge_result else -1.0
+
+        total_reward = citation_reward + accuracy_reward
+        return total_reward, citation_reward

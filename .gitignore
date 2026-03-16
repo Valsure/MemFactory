@@ -6,7 +6,9 @@
 output/
 */output/*
 output
-
+experiments/*.sh
+*copy*.sh
+*.parquet
 
 # Temporary files
 tmp/
