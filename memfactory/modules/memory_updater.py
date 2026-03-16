@@ -204,5 +204,27 @@ class NaiveUpdater(BaseModule):
         print("Warning: memory_updater.generate is deprecated. Please use rollout instead.")
         return None
 
-    def inference(self, batch_data, **kwargs):
-        return []
+    def inference(self, llm_client, batch_data: Dict[str, Any], extraction_texts: List[str], num_generations: int = 1, **kwargs):
+        assert num_generations == 1, "we recommend num_generations=1"
+        # it's ok because bs=1 most of the time
+        context_memories = batch_data['context_memory']
+        # extraction_texts is [BS] since num_gen=1
+        
+        prompts = []
+        for i, ctx_mem in enumerate(context_memories):
+            ext_out = extraction_texts[i]
+            
+            ctx_fmt, cand_fmt, id_map = self.prepare_memory_lists(ctx_mem, ext_out)
+            
+            prompt = UPDATE_MEMORY_PROMPT.format(
+                context_memory=json.dumps(ctx_fmt, ensure_ascii=False, indent=2),
+                candidate_memory=json.dumps(cand_fmt, ensure_ascii=False, indent=2)
+            )
+            prompts.append(prompt)
+            
+        generated_texts = []
+        for prompt in prompts:
+            response = llm_client.chat("You are a smart memory manager.", prompt)
+            generated_texts.append(response)
+            
+        return generated_texts

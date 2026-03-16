@@ -106,6 +106,27 @@ class NaiveExtractor(BaseModule):
         
         return formatted_prompts, generated_texts
 
-    def inference(self, batch_data, **kwargs):
-        # using vllm server
-        return []
+    def inference(self, llm_client, batch_data, num_generations: int = 1, **kwargs):
+        assert num_generations == 1, "we recommend num_generations=1"
+        # it's ok because bs=1 most of the time
+        facts = batch_data['fact']
+        prompts = []
+        for fact in facts:
+            # fact is a list of dicts: [{"role": "user", "content": "...", "timestamp": "..."}]
+            conversation_msg_list = []
+            for msg in fact:
+                msg_fmt = ConversationMessage(
+                    role=msg.get("role", "user"),
+                    content=msg.get("content", ""),
+                    timestamp=msg.get("timestamp", "")
+                )
+                conversation_msg_list.append(msg_fmt)
+            conversation_str = format_conversation(conversation_msg_list)
+            prompts.append(EXTRACTION_PROMPT_EN.format(conversation=conversation_str))
+        
+        generated_texts = []
+        for prompt in prompts:
+            response = llm_client.chat("You are a memory extraction expert.", prompt)
+            generated_texts.append(response)
+            
+        return generated_texts

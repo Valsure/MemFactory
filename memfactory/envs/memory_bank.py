@@ -2,6 +2,7 @@ import json
 import os
 import torch
 import numpy as np
+import warnings
 from typing import List, Dict, Any
 from ..common.registry import ENV_REGISTRY
 from .base import BaseEnv
@@ -228,3 +229,171 @@ class MemoryBankEnv(BaseEnv):
             "extraction": torch.tensor(all_rewards_ext, dtype=torch.float32, device="cuda"), # Assuming cuda
             "update": torch.tensor(all_rewards_upd, dtype=torch.float32, device="cuda")
         }
+
+QA_CITE_PROMPT = """Based on the following memory information, answer the user's question. 
+You MUST cite the exact memory ID when using its information. 
+Return a JSON object containing the answer and a list of cited IDs.
+
+Context Memories:
+{context}
+
+User Question: {question}
+
+Output format:
+```json
+{{
+  "answer": "Your final answer here",
+  "cited_ids": "citing IDs like [1] or [2, 4]"
+}}
+```
+"""
+
+@ENV_REGISTRY.register("rerank_bank")
+class RerankBankEnv(MemoryBankEnv):
+    def compute_reward(self, predictions: Dict[str, List[str]], ground_truths: Dict[str, Any], num_generations: int, **kwargs) -> Dict[str, torch.Tensor]:
+        rerank_texts = predictions['rerank']
+        candidates_list = predictions['candidates'] # List[List[MemoryItem]]
+        
+        bs = len(ground_truths['fact'])
+        all_rewards = []
+        
+        # Prepare evaluation tasks
+        eval_tasks = []
+        
+        for i in range(bs):
+            query = ground_truths['query'][i]
+            answer = ground_truths['answer'][i]
+            
+            for j in range(num_generations):
+                global_idx = i * num_generations + j
+                pred_text = rerank_texts[global_idx]
+                candidates = candidates_list[global_idx] # This corresponds to candidates for this sample
+                
+                # Check if skipped
+                if not pred_text:
+                    all_rewards.append(0.0)
+                    continue
+
+                # 1. Format Reward & ID Extraction
+                selected_ids = []
+                format_reward = 0.0
+                try:
+                    if "<think>" in pred_text and "</think>" in pred_text:
+                        json_part = pred_text.split("</think>")[-1].strip()
+                    else:
+                        json_part = pred_text
+                    
+                    import re
+                    match = re.search(r'\[(.*?)\]', json_part)
+                    if match:
+                        id_strs = match.group(1).split(',')
+                        selected_ids = [int(x.strip()) for x in id_strs if x.strip().isdigit()]
+                        if len(selected_ids) > 0 and len(selected_ids) <= 8:
+                            format_reward = 0.5
+                    else:
+                         format_reward = 0.0
+                except:
+                    format_reward = 0.0
+                
+                if format_reward == 0.0:
+                    all_rewards.append(0.0)
+                    continue
+                    
+                # 2. Prepare QA Task
+                selected_mems = [m for idx, m in enumerate(candidates) if (idx + 1) in selected_ids]
+                context_str = "\n".join([f"[ID: {idx+1}] {m.key}: {m.value}" for idx, m in enumerate(candidates) if (idx + 1) in selected_ids])
+                
+                qa_prompt = QA_CITE_PROMPT.format(context=context_str, question=query)
+                
+                eval_tasks.append({
+                    "global_idx": global_idx,
+                    "query": query,
+                    "answer": answer,
+                    "qa_prompt": qa_prompt,
+                    "selected_ids": selected_ids,
+                    "format_reward": format_reward
+                })
+        
+        # Batch QA Inference
+        if eval_tasks:
+            qa_prompts = [t["qa_prompt"] for t in eval_tasks]
+            
+            # Use ThreadPoolExecutor for concurrent LLM requests
+            from concurrent.futures import ThreadPoolExecutor
+            
+            def call_qa(prompt):
+                return self.llm_client.chat("You are a helpful assistant.", prompt)
+                
+            with ThreadPoolExecutor(max_workers=min(16, len(qa_prompts))) as executor:
+                qa_responses = list(executor.map(call_qa, qa_prompts))
+            
+            # Batch Judge
+            judge_prompts = []
+            for t, pred in zip(eval_tasks, qa_responses):
+                if "</think>" in pred:
+                    pred_content = pred.split("</think>")[-1].strip()
+                else:
+                    pred_content = pred
+                
+                t["pred_answer"] = pred
+                t["pred_content"] = pred_content
+                
+                # Parse JSON to extract just the answer text for judging
+                parsed_json = parse_json_from_text(pred_content)
+                answer_text = parsed_json.get("answer", pred_content) if parsed_json else pred_content
+                t["parsed_json"] = parsed_json
+                
+                judge_prompts.append(JUDGE_PROMPT.format(question=t["query"], answer=t["answer"], prediction=answer_text))
+            
+            def call_judge(prompt):
+                return self.llm_client.chat("You are an impartial judge.", prompt)
+                
+            with ThreadPoolExecutor(max_workers=min(16, len(judge_prompts))) as executor:
+                judge_responses = list(executor.map(call_judge, judge_prompts))
+                
+            # Compute Final Rewards
+            reward_map = {}
+            for t, judge_res in zip(eval_tasks, judge_responses):
+                accuracy_reward = 0.0
+                citation_reward = 0.0
+                
+                # Check accuracy
+                judge_clean = judge_res
+                if "</think>" in judge_res:
+                    judge_clean = judge_res.split("</think>")[-1].strip()
+                
+                if "True" in judge_clean:
+                    accuracy_reward = 1.0
+                    
+                    # Check citations (only if accurate)
+                    cited_count = 0
+                    parsed = t.get("parsed_json", {})
+                    
+                    if parsed and "cited_ids" in parsed and isinstance(parsed["cited_ids"], list):
+                        # Use parsed list if available
+                        for mid in t["selected_ids"]:
+                            if mid in parsed["cited_ids"]:
+                                cited_count += 1
+                    
+                    citation_reward = min(1.0, cited_count * 0.125)
+                
+                total = t["format_reward"] + accuracy_reward + citation_reward
+                reward_map[t["global_idx"]] = total
+                
+            # Initialize full reward list with 0s
+            final_rewards = [0.0] * (bs * num_generations)
+            
+            # Fill known 0s (skipped ones) - actually we can just fill the computed ones
+            for task in eval_tasks:
+                final_rewards[task["global_idx"]] = reward_map[task["global_idx"]]
+                
+            return {
+                "rerank": torch.tensor(final_rewards, dtype=torch.float32, device="cuda")
+            }
+        else:
+             return {
+                "rerank": torch.zeros(bs * num_generations, dtype=torch.float32, device="cuda")
+            }
+
+
+

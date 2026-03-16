@@ -6,12 +6,15 @@ from .base import BaseAgent
 from ..modules.base import Samples
 from ..modules.memory_extractor import NaiveExtractor
 from ..modules.memory_updater import NaiveUpdater
-from ..modules.memory_retriever import NaiveRetriever
+from ..modules.memory_retriever import RerankRetriever
+from ..common.utils import LLMClient
+from ..envs.memory_bank_utils import get_memory_store
 
-@AGENT_REGISTRY.register("memory_r1_agent")
-class MemoryR1Agent(BaseAgent):
+@AGENT_REGISTRY.register("memory_rmm_agent")
+class MemoryRMMAgent(BaseAgent):
     """
     Composite Agent that orchestrates Extractor, Updater, and Retriever modules.
+    Focused on training the Retriever (Reranker).
     """
     def __init__(self, tokenizer, device="cuda", **kwargs):
         super().__init__(tokenizer, device)
@@ -19,8 +22,10 @@ class MemoryR1Agent(BaseAgent):
         # Note: Modules are initialized with the same tokenizer/device
         self.extractor = NaiveExtractor(tokenizer, device, **kwargs)
         self.updater = NaiveUpdater(tokenizer, device, **kwargs)
-        # self.retriever = NaiveRetriever(tokenizer, device, **kwargs)
+        self.retriever = RerankRetriever(tokenizer, device, **kwargs)
         
+        self.llm_client = LLMClient()
+        self.store = get_memory_store()
         self.num_generations = kwargs.get("num_generations", 4)
         
     def process_samples(self, prompts: List[str], responses: List[str], rewards: torch.Tensor, step_type: str) -> Samples:
@@ -83,37 +88,41 @@ class MemoryR1Agent(BaseAgent):
 
     def rollout(self, model: Any, batch_data: Dict[str, Any], **kwargs) -> Dict[str, Samples]:
         """
-        Orchestrate the rollout process:
-        1. Extract memories from 'fact'.
-        2. Update memory bank with 'context_memory' and extracted memories.
-        3. Compute rewards using the Environment.
+        Orchestrate the rollout process for RMM:
+        1. Extract memories (Inference mode, num_gen=1).
+        2. Update memory bank (Inference mode, num_gen=1).
+        3. Train Retriever (Rerank) with Extracted/Updated context.
         """
-        # 1. Extraction
-        facts = batch_data['fact']
-        ext_prompts, ext_texts = self.extractor.generate(model, facts, self.num_generations)
-        
-        # 2. Update & Reward Calculation (delegated to Updater)
-        reward_fn = kwargs.get('reward_fn')
-        upd_prompts, upd_texts, scores = self.updater.rollout(
+        # 1. Extraction (Inference)
+        bs = batch_data['fact'].shape[0]
+        ext_texts = self.extractor.inference(self.llm_client, batch_data, num_generations=1)
+        assert len(ext_texts) == bs, "extraction texts must match batch size"
+        # 2. Update (Inference)
+        upd_texts = self.updater.inference(self.llm_client, batch_data, ext_texts, num_generations=1)
+        assert len(upd_texts) == bs, "update texts must match batch size"
+        # 3. Retriever Rollout (Training)
+        ret_prompts, ret_responses, scores = self.retriever.rollout(
             model, 
             batch_data, 
-            ext_texts, 
-            reward_fn=reward_fn
+            extraction_texts=ext_texts,
+            update_texts=upd_texts,
+            store=self.store,
+            reward_fn=kwargs.get('reward_fn'),
+            num_generations=self.num_generations
         )
-        if not scores or scores['extraction'] is None:
+        
+        if not scores:
             return None
-            
-        # 3. Process into Samples
-        # (tokenize, pad, compute_adv)
-        ext_samples = self.process_samples(ext_prompts, ext_texts, scores['extraction'], 'extraction')
-        upd_samples = self.process_samples(upd_prompts, upd_texts, scores['update'], 'update')
+
+        # 4. Process into Samples
+        ret_samples = self.process_samples(ret_prompts, ret_responses, scores['rerank'], 'rerank')
         
         return {
-            "extraction": ext_samples,
-            "update": upd_samples
+            "default": ret_samples
         }
 
     def inference(self, batch_data, **kwargs):
         # Use vllm server to generate extraction and update samples for given batch data.
         # we encourage you to implement your own inference logic.
         pass
+
