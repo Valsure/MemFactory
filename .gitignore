@@ -8,6 +8,7 @@ output/
 output
 experiments/*.sh
 *copy*.sh
+*True*.sh
 *.parquet
 
 # Temporary files
@@ -15,6 +16,7 @@ tmp/
 **/tmp_data/
 
 # evaluation data
+*/eval_results/*
 *.csv
 *.jsonl
 **settings.json**
