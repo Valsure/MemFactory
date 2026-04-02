@@ -2,7 +2,7 @@
 
 [中文](README.md) | English
 
-Paper: [xxxx](https://example.com/memfactory-paper)
+Paper: [arxiv](https://arxiv.org/abs/2603.29493)
 
 ## Overview
 

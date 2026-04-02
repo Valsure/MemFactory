@@ -2,7 +2,7 @@
 
 中文 | [English](README.en.md)
 
-论文：[xxxx](https://example.com/memfactory-paper)
+论文：[arxiv](https://arxiv.org/abs/2603.29493)
 
 ## 项目简介
 
